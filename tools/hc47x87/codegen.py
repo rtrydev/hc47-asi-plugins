@@ -59,12 +59,17 @@ class Item:
 
 
 class FuncTranslator:
-    def __init__(self, mod, fi, ftol_vas, ci_funcs, diag=False):
+    def __init__(self, mod, fi, ftol_vas, ci_funcs, diag=False, pc24=False):
         self.mod = mod
         self.fi = fi
         self.ftol_vas = ftol_vas
         self.ci_funcs = ci_funcs
         self.diag = diag      # emit NaN tripwire at float returns
+        # pc24: emulate x87 precision-control = single by rounding every
+        # arithmetic result to float. NOT needed for this game (measured
+        # in-game CW is PC=double, which SSE doubles already match); kept
+        # for ports to games that do run at PC=single.
+        self.pc24 = pc24
         self.items = []       # (va_or_None, Item)
         self.va_index = {}    # original va -> item list index (for labels)
 
@@ -137,6 +142,24 @@ class FuncTranslator:
     def _st_ops(self, ins):
         return [ST_REGS[op.reg] for op in ins.operands
                 if op.type == X86_OP_REG and op.reg in ST_REGS]
+
+    def diag_check_slot(self, slot):
+        """--diag: record if xmm slot just became NaN (H_DIAGNAN checks)."""
+        if not self.diag:
+            return
+        self.emit(E.lea_esp(-8))
+        self.emit(E.movsd_espmem_xmm(0, slot))
+        self.emit(b"\xE8\x00\x00\x00\x00", [(1, REL32_HELPER, H_DIAGNAN)])
+        self.emit(E.lea_esp(8))
+
+    def post_arith(self, slot, is_div=False):
+        """Applied after every arithmetic result: 24-bit rounding (PC=single
+        emulation) and optional NaN tripwire."""
+        if self.pc24:
+            self.emit(E.sse_rr(*E.CVTSD2SS, 7, slot))
+            self.emit(E.sse_rr(*E.CVTSS2SD, slot, 7))
+        if is_div:
+            self.diag_check_slot(slot)
 
     def helper1(self, hid, x):
         """st0-in/st0-out helper on xmm slot x."""
@@ -402,6 +425,7 @@ class FuncTranslator:
             return
         if mnem == "fsqrt":
             self.emit(E_.sse_rr(*E_.SQRTSD, X(t), X(t)))
+            self.post_arith(X(t), is_div=True)  # sqrt(neg) births NaN: check
             return
 
         ARITH = {"fadd": E_.ADDSD, "fmul": E_.MULSD, "fsub": E_.SUBSD,
@@ -412,6 +436,7 @@ class FuncTranslator:
                  "fidiv": E_.DIVSD, "fisubr": E_.SUBSD, "fidivr": E_.DIVSD}
         if mnem in ARITH:
             op2 = ARITH[mnem]
+            is_div = "div" in mnem
             reverse = "r" in mnem.replace("f", "", 1)  # fsubr/fdivr/fsubrp/fdivrp/fisubr/fidivr
             if mem is not None:
                 # rhs -> xmm7 (or direct mem form when possible)
@@ -433,6 +458,7 @@ class FuncTranslator:
                 elif msz == 8:
                     if not reverse:
                         self.emit_mem(E_.sse_rm(op2[0], op2[1], X(t), mem))
+                        self.post_arith(X(t), is_div)
                         return
                     self.emit_mem(E_.sse_rm(*E_.MOVSD_LOAD, 7, mem))
                     rhs_in_7 = True
@@ -444,6 +470,7 @@ class FuncTranslator:
                     # st0 = rhs OP st0
                     self.emit(E_.sse_rr(op2[0], op2[1], 7, X(t)))
                     self.emit(E_.sse_rr(*E_.MOVSD_LOAD, X(t), 7))
+                self.post_arith(X(t), is_div)
                 return
             # register forms
             pop = mnem.endswith("p") and mnem not in ("fsub", "fisub")  # *p forms
@@ -456,6 +483,7 @@ class FuncTranslator:
                     self.emit(E_.sse_rr(*E_.MOVSD_LOAD, 7, X(t)))
                     self.emit(E_.sse_rr(op2[0], op2[1], 7, k))
                     self.emit(E_.sse_rr(*E_.MOVSD_LOAD, k, 7))
+                self.post_arith(k, is_div)
                 return
             # non-pop, two-reg (or implicit st0,st1)
             if len(sts) >= 2:
@@ -479,6 +507,7 @@ class FuncTranslator:
                     self.emit(E_.sse_rr(*E_.MOVSD_LOAD, 7, X(t)))
                     self.emit(E_.sse_rr(op2[0], op2[1], 7, k))
                     self.emit(E_.sse_rr(*E_.MOVSD_LOAD, k, 7))
+            self.post_arith(X(t) if dst_is_st0 else k, is_div)
             return
 
         if mnem in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp",

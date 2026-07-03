@@ -123,6 +123,7 @@ static void logf_(const char *fmt, ...)
 /* ---- diagnostics (used by HC47_DIAG builds of helpers.S) ---- */
 uint32_t g_diag_calls[16];
 uint32_t g_diag_widx;
+uint16_t g_cw_main;   /* CW of whichever game thread last ran a helper */
 struct DiagRec { uint32_t caller, tag; } g_diag_ring[64];
 
 typedef struct {
@@ -166,8 +167,19 @@ static DWORD WINAPI diag_thread(LPVOID arg)
 {
     (void)arg;
     uint32_t last_widx = 0, last_calls = 0;
+    uint16_t last_cw = 0xFFFF;
     for (;;) {
         Sleep(2000);
+        {
+            uint16_t cw = g_cw_main;   /* captured inside helpers */
+            if (cw && cw != last_cw) {
+                last_cw = cw;
+                logf_("diag: game-thread FPU CW=0x%04X (PC=%s RC=%u)", cw,
+                      (cw & 0x300) == 0x000 ? "single" :
+                      (cw & 0x300) == 0x200 ? "double" : "extended",
+                      (cw >> 10) & 3);
+            }
+        }
         uint32_t total = 0;
         for (int i = 0; i < 16; i++) total += g_diag_calls[i];
         if (total != last_calls) {
@@ -182,9 +194,16 @@ static DWORD WINAPI diag_thread(LPVOID arg)
         }
         uint32_t w = g_diag_widx;
         if (w != last_widx) {
+            static uint32_t seen_caller[256], seen_n[256];
             uint32_t from = w > 64 && w - last_widx > 64 ? w - 64 : last_widx;
             for (uint32_t i = from; i != w; i++) {
                 struct DiagRec r = g_diag_ring[i & 63];
+                /* log each unique site at most 3 times */
+                uint32_t h = (r.caller * 2654435761u) >> 24;
+                if (seen_caller[h] == r.caller && seen_n[h] >= 3)
+                    continue;
+                if (seen_caller[h] != r.caller) { seen_caller[h] = r.caller; seen_n[h] = 0; }
+                seen_n[h]++;
                 char where[128];
                 diag_resolve(r.caller, where, sizeof(where));
                 if (r.tag == 13)

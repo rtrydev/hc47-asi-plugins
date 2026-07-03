@@ -60,6 +60,10 @@ def main():
                     help="comma-separated function RVAs (hex) to skip")
     ap.add_argument("--diag", action="store_true",
                     help="emit NaN tripwire at float-returning rets")
+    ap.add_argument("--pc24", action="store_true",
+                    help="round every arithmetic result to float (PC=single)")
+    ap.add_argument("--include-all", action="store_true",
+                    help="ignore all exclusion lists (testing only)")
     args = ap.parse_args()
 
     path = os.path.join(args.game, args.module)
@@ -73,7 +77,18 @@ def main():
     # never hook the CRT helpers themselves (their callers are rewritten)
     helper_vas = ftol | set(ci)
     excl_rvas = {int(x, 16) for x in args.exclude.split(",") if x}
-    excl_rvas |= DEFAULT_EXCLUDE.get(os.path.basename(path).lower(), set())
+    if not args.include_all:
+        excl_rvas |= DEFAULT_EXCLUDE.get(os.path.basename(path).lower(), set())
+        excl_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "exclusions",
+                                 os.path.basename(path).lower() + ".txt")
+        if os.path.exists(excl_file):
+            with open(excl_file) as fh:
+                for line in fh:
+                    line = line.split("#")[0].strip()
+                    if line:
+                        excl_rvas.add(int(line, 16))
+            print(f"loaded {excl_file}")
 
     # safety: don't hook functions whose first 5 bytes are a branch target
     tgts = branch_targets(mod)
@@ -94,7 +109,8 @@ def main():
     n_x87_done = 0
     for f in ok:
         try:
-            tr = FuncTranslator(mod, f, ftol, ci, diag=args.diag)
+            tr = FuncTranslator(mod, f, ftol, ci, diag=args.diag,
+                                pc24=args.pc24)
             blob, fixups = tr.run()
         except (TranslateError, ValueError) as e:
             fails[str(e)] += 1

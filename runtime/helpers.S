@@ -21,6 +21,7 @@
 .macro DIAGCOUNT id
     pushfd
     inc     dword ptr [_g_diag_calls + \id*4]
+    fnstcw  [_g_cw_main]          /* capture the CALLING thread's CW */
     popfd
 .endm
 .macro DIAGCHK tag, resoff
@@ -30,6 +31,11 @@
     and     eax, 0x7FF00000
     cmp     eax, 0x7FF00000
     jne     9f
+    /* NaN only: skip legitimate +/-Inf sentinels (mantissa == 0) */
+    mov     eax, [esp + \resoff + 12]
+    shl     eax, 12                       /* drop sign+exponent */
+    or      eax, [esp + \resoff + 8]      /* low dword */
+    jz      9f
     push    ebx
     push    ecx
     mov     eax, [_g_diag_widx]

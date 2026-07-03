@@ -154,14 +154,25 @@ static void run_one(void *fn, uint32_t seed, Result *res, uint32_t *mem_out)
     restore_writable();
     memcpy(g_scratch, g_scratch_init, sizeof(g_scratch));
     g_seed = seed ^ 0x9E3779B9u;
+    /* domain edges where math-library code branches */
+    static const double edges[] = {
+        1.0, -1.0, 0.0, -0.0, 0.5, -0.5, 2.0,
+        0.9999999999999999, 1.0000000000000002, -0.9999999999999999,
+        3.14159265358979323846, 1.57079632679489661923,
+        6.28318530717958647692, 1e-8, -1e-8, 1e8, 100.0, 360.0, -360.0,
+    };
     uint32_t args[16];
     for (int i = 0; i < 16; i++) {
-        /* alternate: pointer into scratch / float value / small int */
-        uint32_t k = rnd() % 3;
+        uint32_t k = rnd() % 4;
         if (k == 0)
             args[i] = (uint32_t)(uintptr_t)&g_scratch[(rnd() % (SCRATCH_WORDS - 64))];
         else if (k == 1) {
             float f = rnd_float(); memcpy(&args[i], &f, 4);
+        } else if (k == 3 && i < 15) {
+            /* an edge-value double spanning two arg slots */
+            double d = edges[rnd() % (sizeof(edges)/sizeof(edges[0]))];
+            memcpy(&args[i], &d, 8);
+            i++;
         } else
             args[i] = rnd() % 64;
     }
