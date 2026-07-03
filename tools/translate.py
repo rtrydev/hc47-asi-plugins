@@ -58,6 +58,8 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--exclude", default="",
                     help="comma-separated function RVAs (hex) to skip")
+    ap.add_argument("--diag", action="store_true",
+                    help="emit NaN tripwire at float-returning rets")
     args = ap.parse_args()
 
     path = os.path.join(args.game, args.module)
@@ -92,7 +94,7 @@ def main():
     n_x87_done = 0
     for f in ok:
         try:
-            tr = FuncTranslator(mod, f, ftol, ci)
+            tr = FuncTranslator(mod, f, ftol, ci, diag=args.diag)
             blob, fixups = tr.run()
         except (TranslateError, ValueError) as e:
             fails[str(e)] += 1

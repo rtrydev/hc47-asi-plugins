@@ -100,9 +100,10 @@ static DataArea g_data = {
 /* helpers.S — order must match codegen helper ids */
 extern void hlp_sin(void), hlp_cos(void), hlp_sincos(void), hlp_tan(void),
     hlp_atan2(void), hlp_yl2x(void), hlp_yl2xp1(void), hlp_2xm1(void),
-    hlp_scale(void), hlp_rndint(void), hlp_i64tod(void), hlp_dtoi64(void);
+    hlp_scale(void), hlp_rndint(void), hlp_i64tod(void), hlp_dtoi64(void),
+    hlp_diagnan(void), hlp_emptypop(void);
 
-static void *g_helpers[12];
+static void *g_helpers[14];
 
 /* ---- logging ---- */
 static FILE *g_log;
@@ -118,6 +119,88 @@ static void logf_(const char *fmt, ...)
     fputc('\n', g_log);
     fflush(g_log);
 }
+
+/* ---- diagnostics (used by HC47_DIAG builds of helpers.S) ---- */
+uint32_t g_diag_calls[16];
+uint32_t g_diag_widx;
+struct DiagRec { uint32_t caller, tag; } g_diag_ring[64];
+
+typedef struct {
+    char module[32];
+    uint8_t *base, *blob;
+    uint32_t blob_size, n_funcs;
+    FuncRec *funcs;
+} Applied;
+static Applied g_applied[16];
+static int g_n_applied;
+
+static const Applied *find_applied(uint32_t addr)
+{
+    for (int i = 0; i < g_n_applied; i++) {
+        const Applied *a = &g_applied[i];
+        if (addr >= (uint32_t)(uintptr_t)a->blob &&
+            addr < (uint32_t)(uintptr_t)a->blob + a->blob_size)
+            return a;
+    }
+    return NULL;
+}
+
+static void diag_resolve(uint32_t caller, char *out, size_t n)
+{
+    const Applied *a = find_applied(caller);
+    if (!a) { snprintf(out, n, "addr %08x (not in a blob)", caller); return; }
+    uint32_t off = caller - (uint32_t)(uintptr_t)a->blob;
+    for (uint32_t i = 0; i < a->n_funcs; i++) {
+        FuncRec *fr = &a->funcs[i];
+        if (off >= fr->blob_off && off < fr->blob_off + fr->blob_len) {
+            snprintf(out, n, "%s+0x%x (blob site +0x%x)",
+                     a->module, fr->rva, off - fr->blob_off);
+            return;
+        }
+    }
+    snprintf(out, n, "%s blob+0x%x (no func)", a->module, off);
+}
+
+#ifdef HC47_DIAG
+static DWORD WINAPI diag_thread(LPVOID arg)
+{
+    (void)arg;
+    uint32_t last_widx = 0, last_calls = 0;
+    for (;;) {
+        Sleep(2000);
+        uint32_t total = 0;
+        for (int i = 0; i < 16; i++) total += g_diag_calls[i];
+        if (total != last_calls) {
+            last_calls = total;
+            logf_("diag: helper calls sin=%u cos=%u sincos=%u tan=%u "
+                  "atan2=%u yl2x=%u yl2xp1=%u 2xm1=%u scale=%u rndint=%u "
+                  "i64tod=%u dtoi64=%u",
+                  g_diag_calls[0], g_diag_calls[1], g_diag_calls[2],
+                  g_diag_calls[3], g_diag_calls[4], g_diag_calls[5],
+                  g_diag_calls[6], g_diag_calls[7], g_diag_calls[8],
+                  g_diag_calls[9], g_diag_calls[10], g_diag_calls[11]);
+        }
+        uint32_t w = g_diag_widx;
+        if (w != last_widx) {
+            uint32_t from = w > 64 && w - last_widx > 64 ? w - 64 : last_widx;
+            for (uint32_t i = from; i != w; i++) {
+                struct DiagRec r = g_diag_ring[i & 63];
+                char where[128];
+                diag_resolve(r.caller, where, sizeof(where));
+                if (r.tag == 13)
+                    logf_("diag: EMPTY-FPU-POP guarded (0.0 substituted) at %s",
+                          where);
+                else
+                    logf_("diag: NaN/Inf %s (tag %u, helper %u) at %s",
+                          r.tag >= 100 ? "INPUT" : "OUTPUT",
+                          r.tag, r.tag % 100, where);
+            }
+            last_widx = w;
+        }
+    }
+    return 0;
+}
+#endif
 
 /* ---- pending patches ---- */
 #define MAX_PATCHES 16
@@ -219,6 +302,17 @@ static int apply_patch(Pending *p, HMODULE mod)
     FlushInstructionCache(GetCurrentProcess(), base,
                           nt->OptionalHeader.SizeOfImage);
     FlushInstructionCache(GetCurrentProcess(), blob, h->blob_total);
+    if (g_n_applied < 16) {
+        Applied *a = &g_applied[g_n_applied++];
+        memcpy(a->module, p->module, 32);
+        a->base = base;
+        a->blob = blob;
+        a->blob_size = h->blob_total;
+        a->n_funcs = h->n_funcs;
+        a->funcs = (FuncRec *)HeapAlloc(GetProcessHeap(), 0,
+                                        h->n_funcs * sizeof(FuncRec));
+        memcpy(a->funcs, funcs, h->n_funcs * sizeof(FuncRec));
+    }
     logf_("[%s] applied: %u/%lu hooks, blob %lu KB at %p (delta %+d)",
           p->module, installed, (unsigned long)h->n_funcs,
           (unsigned long)h->blob_total / 1024, blob, delta);
@@ -277,6 +371,8 @@ static void init(HMODULE self)
     g_helpers[6] = (void *)hlp_yl2xp1; g_helpers[7] = (void *)hlp_2xm1;
     g_helpers[8] = (void *)hlp_scale;  g_helpers[9] = (void *)hlp_rndint;
     g_helpers[10] = (void *)hlp_i64tod; g_helpers[11] = (void *)hlp_dtoi64;
+    g_helpers[12] = (void *)hlp_diagnan;
+    g_helpers[13] = (void *)hlp_emptypop;
 
     GetModuleFileNameA(self, g_dir, sizeof(g_dir));
     char *sl = strrchr(g_dir, '\\');
@@ -332,6 +428,10 @@ static void init(HMODULE self)
         return;
     }
     logf_("TEB scratch at fs:[0x%X]", g_teb_fp_disp);
+#ifdef HC47_DIAG
+    logf_("DIAGNOSTIC BUILD: helper NaN tracing enabled");
+    CreateThread(NULL, 0, diag_thread, NULL, 0, NULL);
+#endif
 
     check_pending();  /* modules that are already loaded */
 

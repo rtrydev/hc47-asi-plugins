@@ -65,8 +65,9 @@ static DataArea g_data = {
 
 extern void hlp_sin(void), hlp_cos(void), hlp_sincos(void), hlp_tan(void),
     hlp_atan2(void), hlp_yl2x(void), hlp_yl2xp1(void), hlp_2xm1(void),
-    hlp_scale(void), hlp_rndint(void), hlp_i64tod(void), hlp_dtoi64(void);
-static void *g_helpers[12];
+    hlp_scale(void), hlp_rndint(void), hlp_i64tod(void), hlp_dtoi64(void),
+    hlp_diagnan(void), hlp_emptypop(void);
+static void *g_helpers[14];
 
 /* probe.S */
 extern uint32_t call_probe(void *fn, uint32_t ecx, uint32_t edx,
@@ -201,6 +202,7 @@ int main(int argc, char **argv)
     g_helpers[6] = hlp_yl2xp1; g_helpers[7] = hlp_2xm1;
     g_helpers[8] = hlp_scale; g_helpers[9] = hlp_rndint;
     g_helpers[10] = hlp_i64tod; g_helpers[11] = hlp_dtoi64;
+    g_helpers[12] = hlp_diagnan; g_helpers[13] = hlp_emptypop;
 
     if (!alloc_teb_scratch()) { printf("FAIL: TEB scratch\n"); return 2; }
     HMODULE mod = LoadLibraryExA(argv[1], NULL, DONT_RESOLVE_DLL_REFERENCES);
@@ -264,6 +266,8 @@ int main(int argc, char **argv)
 
     int tested = 0, passed = 0, mism = 0, faults = 0, skipped = 0, ax_junk = 0;
     for (int i = 0; i < nleaf && tested < maxf; i++) {
+        fprintf(stderr, "@func %05x\n", leaf[i]);  /* hang tracing */
+        fflush(stderr);
         /* find func rec */
         FuncRec *fr = NULL;
         for (uint32_t j = 0; j < h->n_funcs; j++)

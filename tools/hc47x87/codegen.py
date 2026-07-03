@@ -25,7 +25,7 @@ ABS32_MODULE, REL32_MODULE, REL32_HELPER, ABS32_DATA, \
 
 # helper ids (must match runtime)
 H_SIN, H_COS, H_SINCOS, H_TAN, H_ATAN2, H_YL2X, H_YL2XP1, H_2XM1, \
-    H_SCALE, H_RNDINT, H_I64TOD, H_DTOI64 = range(12)
+    H_SCALE, H_RNDINT, H_I64TOD, H_DTOI64, H_DIAGNAN, H_EMPTYPOP = range(14)
 
 # data area offsets (must match runtime)
 D_ZERO, D_ONE, D_PI, D_L2E, D_L2T, D_LG2, D_LN2 = 0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30
@@ -59,11 +59,12 @@ class Item:
 
 
 class FuncTranslator:
-    def __init__(self, mod, fi, ftol_vas, ci_funcs):
+    def __init__(self, mod, fi, ftol_vas, ci_funcs, diag=False):
         self.mod = mod
         self.fi = fi
         self.ftol_vas = ftol_vas
         self.ci_funcs = ci_funcs
+        self.diag = diag      # emit NaN tripwire at float returns
         self.items = []       # (va_or_None, Item)
         self.va_index = {}    # original va -> item list index (for labels)
 
@@ -194,11 +195,37 @@ class FuncTranslator:
             if d > 0:
                 self.reload_after_call(d, returns_st0)
             elif returns_st0:
-                # callee returned a value in st0: move it to xmm slot 0
-                self.emit(E.lea_esp(-8))
-                self.emit(E.FSTP_QWORD_ESP)
-                self.emit(E.movsd_xmm_espmem(0, 0))
-                self.emit(E.lea_esp(8))
+                if va in fi.verified_returns:
+                    # callee provably returned a value in st0
+                    self.emit(E.lea_esp(-8))
+                    self.emit(E.FSTP_QWORD_ESP)
+                    self.emit(E.movsd_xmm_espmem(0, 0))
+                    self.emit(E.lea_esp(8))
+                else:
+                    # unverified (indirect/opaque callee): the dynamic target
+                    # may not have pushed st0. fxam-check; pop if present,
+                    # else record (diag) and substitute 0.0.
+                    self.emit(
+                        b"\x50"                      # push eax
+                        b"\x9C"                      # pushfd
+                        b"\xD9\xE5"                  # fxam
+                        b"\xDF\xE0"                  # fnstsw ax
+                        b"\x80\xE4\x45"              # and ah, 0x45
+                        b"\x80\xFC\x41"              # cmp ah, 0x41 (empty)
+                        b"\x74\x14"                  # je Lempty
+                        b"\x9D"                      # popfd
+                        b"\x58"                      # pop eax
+                        b"\x8D\x64\x24\xF8"          # lea esp,[esp-8]
+                        b"\xDD\x1C\x24"              # fstp qword [esp]
+                        b"\xF2\x0F\x10\x04\x24"      # movsd xmm0,[esp]
+                        b"\x8D\x64\x24\x08"          # lea esp,[esp+8]
+                        b"\xEB\x0F"                  # jmp Ldone
+                        b"\x9D"                      # Lempty: popfd
+                        b"\x58"                      # pop eax
+                        b"\xE8\x00\x00\x00\x00"      # call H_EMPTYPOP
+                        b"\xF2\x0F\x10\x05\x00\x00\x00\x00",  # movsd xmm0,[zero]
+                        [(37, REL32_HELPER, H_EMPTYPOP),
+                         (45, ABS32_DATA, D_ZERO)])
             return
 
         if mnem in RET:
@@ -206,6 +233,10 @@ class FuncTranslator:
                 # ABI: leave return value in real st0
                 self.emit(E.lea_esp(-8))
                 self.emit(E.movsd_espmem_xmm(0, 0))
+                if self.diag:
+                    # NaN tripwire: helper checks [esp+4], records caller
+                    self.emit(b"\xE8\x00\x00\x00\x00",
+                              [(1, REL32_HELPER, H_DIAGNAN)])
                 self.emit(E.FLD_QWORD_ESP)
                 self.emit(E.lea_esp(8))
             self.copy(va, ins)

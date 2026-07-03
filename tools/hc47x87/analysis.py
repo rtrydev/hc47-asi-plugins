@@ -83,6 +83,7 @@ class FuncInfo:
         self.fnstsw_kind = {}       # fnstsw VA -> 'fresh' | 'stale'
         self.jumptables = {}        # jmp VA -> (table_va, [target VAs])
         self.ret_depths = set()     # x87 depth at each ret
+        self.verified_returns = set()  # call_returns proven by callee analysis
 
 
 # EFLAGS read/write masks from capstone metadata
@@ -178,7 +179,7 @@ class Analyzer:
                 fi.insns.clear(); fi.depth_in.clear(); fi.order = []
                 fi.leaders.clear(); fi.flagsrc.clear()
                 fi.fnstsw_kind.clear(); fi.jumptables.clear()
-                fi.ret_depths.clear()
+                fi.ret_depths.clear(); fi.verified_returns.clear()
                 fi.n_x87 = 0; fi.max_depth = 0; fi.end = fi.start
                 continue
             except Reject as r:
@@ -191,6 +192,17 @@ class Analyzer:
             fi.status = "fixpoint"
             return fi
         fi.order = sorted(fi.insns)
+        # Unverified st0-return marks (indirect / unanalyzable callees) rest
+        # on one observed path. If the pushed value can reach a ret (depth 1),
+        # a dynamic target that does NOT return a float would make us leak
+        # garbage onto the real FPU stack -> global NaN cascade. Require full
+        # consumption instead.
+        if (fi.call_returns - fi.verified_returns) and \
+                any(d != 0 for d in fi.ret_depths):
+            fi.status = "unverified-st0-ret"
+            fi.n_x87 = sum(1 for va in fi.order
+                           if x87.is_x87(fi.insns[va].mnemonic))
+            return fi
         fi.n_x87 = sum(
             1 for va in fi.order
             if x87.is_x87(fi.insns[va].mnemonic)
@@ -298,6 +310,7 @@ class Analyzer:
                     if kr == 1:
                         # callee provably returns a value in st0
                         fi.call_returns.add(va)
+                        fi.verified_returns.add(va)
                         depth += 1
                         if depth > 7:
                             raise Reject("depth8")
