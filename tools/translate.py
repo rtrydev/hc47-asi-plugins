@@ -26,6 +26,13 @@ from analyze import find_ftol, find_ci, GAME
 
 import capstone
 
+# Functions other mods patch mid-body: hooking them would make those byte
+# patches dead code. Known: HitmanCodename47WidescreenFix FOV/draw-distance
+# sites (+24e71/+24ec2 in func 24d90, +90167 in func 900c0).
+DEFAULT_EXCLUDE = {
+    "hitmandlc.dlc": {0x24D90, 0x900C0},
+}
+
 
 def branch_targets(mod):
     """All direct jmp/jcc/call targets module-wide (linear sweep)."""
@@ -64,6 +71,7 @@ def main():
     # never hook the CRT helpers themselves (their callers are rewritten)
     helper_vas = ftol | set(ci)
     excl_rvas = {int(x, 16) for x in args.exclude.split(",") if x}
+    excl_rvas |= DEFAULT_EXCLUDE.get(os.path.basename(path).lower(), set())
 
     # safety: don't hook functions whose first 5 bytes are a branch target
     tgts = branch_targets(mod)
