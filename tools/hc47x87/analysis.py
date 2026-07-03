@@ -80,6 +80,8 @@ class FuncInfo:
         self.has_fldcw = False
         self.leaders = set()        # branch-target VAs (block leaders)
         self.flagsrc = {}           # fnstsw VA -> producing compare VA
+        self.fnstsw_kind = {}       # fnstsw VA -> 'fresh' | 'stale'
+        self.jumptables = {}        # jmp VA -> (table_va, [target VAs])
 
 
 # EFLAGS read/write masks from capstone metadata
@@ -171,6 +173,7 @@ class Analyzer:
             except _RetryWalk:
                 fi.insns.clear(); fi.depth_in.clear(); fi.order = []
                 fi.leaders.clear(); fi.flagsrc.clear()
+                fi.fnstsw_kind.clear(); fi.jumptables.clear()
                 fi.n_x87 = 0; fi.max_depth = 0; fi.end = fi.start
                 continue
             except Reject as r:
@@ -213,16 +216,24 @@ class Analyzer:
 
     def _walk(self, fi):
         mod = self.mod
-        # path state: depth, last_call, last_cmp, flags_ok, owner
+        # path state: depth, last_call, last_cmp, flags_ok, owner, ah_saved
         # flags_ok: EFLAGS currently match original-execution EFLAGS
         # owner: VA of most recent EFLAGS writer in translated execution
-        work = [(fi.start, (0, None, None, True, None))]
+        # ah_saved: compare VA whose status-AH snapshot is in TEB scratch
+        work = [(fi.start, (0, None, None, True, None, None))]
         state = {}
         while work:
             va, st = work.pop()
             prev = state.get(va)
             if prev is not None:
                 if prev[0] != st[0]:
+                    # one path may be missing an st0-returning call mark
+                    lo, hi = (st, prev) if st[0] < prev[0] else (prev, st)
+                    lc = lo[1]
+                    if hi[0] == lo[0] + 1 and lc is not None \
+                            and lc not in fi.call_returns:
+                        fi.call_returns.add(lc)
+                        raise _RetryWalk()
                     raise Reject("depth-merge")
                 merged = (
                     st[0],
@@ -230,6 +241,7 @@ class Analyzer:
                     prev[2] if prev[2] == st[2] else None,
                     prev[3] and st[3],
                     prev[4] if prev[4] == st[4] else None,
+                    prev[5] if prev[5] == st[5] else None,
                 )
                 if merged == prev:
                     continue
@@ -237,7 +249,7 @@ class Analyzer:
                 st = merged
             else:
                 state[va] = st
-            depth, last_call, last_cmp, flags_ok, owner = st
+            depth, last_call, last_cmp, flags_ok, owner, ah_saved = st
             if not (fi.start <= va < fi.bound):
                 raise Reject("flow-escape")
             ins = mod.insn_at(va)
@@ -252,13 +264,12 @@ class Analyzer:
             if uses_mmx_or_xmm(ins):
                 raise Reject("mmx-sse")
             if mnem == "int3":
-                raise Reject("int3")
+                continue    # trap: copied verbatim, path terminates
             if mnem in x87.UNSUPPORTED:
                 raise Reject(f"unsup:{mnem}")
 
             if x87.is_x87(mnem):
-                st2 = self._x87_step(fi, va, ins, depth, last_call,
-                                     last_cmp, flags_ok, owner)
+                st2 = self._x87_step(fi, va, ins, st)
                 work.append((nxt, st2))
                 continue
 
@@ -283,12 +294,14 @@ class Analyzer:
                     depth += nret - nargs
                     last_call = None
                 else:
-                    if depth != 0:
-                        raise Reject("depth-across-call")
+                    # depth > 0 is fine: live slots are carried across the
+                    # call on the real x87 stack (codegen spill/reload)
                     if va in fi.call_returns:
-                        depth = 1
+                        depth += 1
+                        if depth > 7:
+                            raise Reject("depth8")
                     last_call = va
-                work.append((nxt, (depth, last_call, None, True, va)))
+                work.append((nxt, (depth, last_call, None, True, va, None)))
                 continue
 
             if writes:
@@ -299,12 +312,20 @@ class Analyzer:
                     raise Reject("ret-depth")
                 continue
 
+            st2 = (depth, last_call, last_cmp, flags_ok, owner, ah_saved)
+
             if mnem in ("jmp", "ljmp"):
                 op = ins.operands[0]
                 if op.type != X86_OP_IMM:
-                    raise Reject("indirect-jmp")
+                    targets = self._jump_table(fi, va, ins)
+                    for t in targets:
+                        fi.leaders.add(t)
+                        if fi.start <= t < fi.bound:
+                            work.append((t, st2))
+                        elif depth != 0:
+                            raise Reject("tailjmp-depth")
+                    continue
                 t = op.imm
-                st2 = (depth, last_call, last_cmp, flags_ok, owner)
                 if fi.start <= t < fi.bound:
                     fi.leaders.add(t)
                     work.append((t, st2))
@@ -322,7 +343,6 @@ class Analyzer:
                 if op.type != X86_OP_IMM:
                     raise Reject("indirect-jcc")
                 t = op.imm
-                st2 = (depth, last_call, last_cmp, flags_ok, owner)
                 if fi.start <= t < fi.bound:
                     fi.leaders.add(t)
                     work.append((t, st2))
@@ -334,30 +354,91 @@ class Analyzer:
                 work.append((nxt, st2))
                 continue
 
-            work.append((nxt, (depth, last_call, last_cmp, flags_ok, owner)))
+            work.append((nxt, st2))
 
-    def _x87_step(self, fi, va, ins, depth, last_call, last_cmp,
-                  flags_ok, owner):
+    def _jump_table(self, fi, va, ins):
+        """MSVC switch: jmp [table + reg*4], optionally through a byte table.
+        Returns list of targets; records fi.jumptables[va]. Raises Reject if
+        the pattern can't be proven."""
+        mod = self.mod
+        op = ins.operands[0]
+        if op.type != X86_OP_MEM:
+            raise Reject("indirect-jmp")
+        m = op.mem
+        if m.base != 0 or m.index == 0 or m.scale != 4:
+            raise Reject("indirect-jmp")
+        table_va = m.disp & 0xFFFFFFFF
+        if not mod.in_text(table_va):
+            raise Reject("jt-table-loc")
+
+        # scan back for the bounding `cmp <reg>, imm` and optional byte-table
+        # movzx between it and the jmp
+        import struct
+        bound = None
+        byte_table = None
+        scan = []
+        back = va
+        for _ in range(8):
+            prevs = [p for p in fi.insns if p < back and
+                     p + fi.insns[p].size == back]
+            if len(prevs) != 1:
+                break
+            back = prevs[0]
+            scan.append(fi.insns[back])
+            if fi.insns[back].mnemonic == "cmp":
+                ops = fi.insns[back].operands
+                if len(ops) == 2 and ops[1].type == X86_OP_IMM:
+                    bound = ops[1].imm
+                break
+        if bound is None or not (0 <= bound < 4096):
+            raise Reject("jt-nobound")
+        for s in scan:
+            if s.mnemonic == "movzx" and len(s.operands) == 2 and \
+                    s.operands[1].type == X86_OP_MEM and \
+                    s.operands[1].size == 1:
+                byte_table = s.operands[1].mem.disp & 0xFFFFFFFF
+
+        if byte_table is not None:
+            raw = mod.read(byte_table, bound + 1)
+            if len(raw) != bound + 1:
+                raise Reject("jt-bytetable")
+            n_entries = max(raw) + 1
+        else:
+            n_entries = bound + 1
+
+        raw = mod.read(table_va, n_entries * 4)
+        if len(raw) != n_entries * 4:
+            raise Reject("jt-read")
+        targets = list(struct.unpack(f"<{n_entries}I", raw))
+        for t in targets:
+            if not (fi.start <= t < fi.bound):
+                raise Reject("jt-target-out")
+        fi.jumptables[va] = (table_va, targets)
+        return targets
+
+    def _x87_step(self, fi, va, ins, st):
+        depth, last_call, last_cmp, flags_ok, owner, ah_saved = st
         mnem = ins.mnemonic
         if mnem in ("wait", "fwait", "fnop"):
-            return depth, last_call, last_cmp, flags_ok, owner
+            return st
         if mnem in x87.RESET:
-            return 0, last_call, None, flags_ok, owner
+            return (0, last_call, None, flags_ok, owner, ah_saved)
 
         if mnem in ("fnstsw", "fstsw"):
             if ins.op_str not in ("ax", "eax"):
                 raise Reject("fnstsw-mem")
             if last_cmp is None:
                 raise Reject("fnstsw-nosrc")
-            if owner != last_cmp:
-                raise Reject("fnstsw-stale")
+            # translated compares snapshot EFLAGS to TEB; fnstsw reads the
+            # snapshot without touching EFLAGS, so intervening flag writers
+            # are harmless.
             fi.flagsrc[va] = last_cmp
             self._check_c1(fi, va)
-            return depth, last_call, last_cmp, flags_ok, owner
+            return (depth, last_call, last_cmp, flags_ok, owner, ah_saved)
 
         if mnem in ("fnstcw", "fstcw", "fldcw"):
             fi.has_fldcw = True
-            return depth, last_call, last_cmp, flags_ok, owner
+            return st
 
         # 80-bit / BCD memory forms
         msz = mem_size(ins)
@@ -382,7 +463,7 @@ class Analyzer:
         elif mnem in ("fist", "fistp"):
             # translated form tests the shadow control word: writes EFLAGS
             flags_ok, owner = False, va
-        return depth, last_call, last_cmp, flags_ok, owner
+        return (depth, last_call, last_cmp, flags_ok, owner, ah_saved)
 
     def _check_c1(self, fi, va):
         """Reject if code after fnstsw ax inspects C1 (AH bit 1) or AL."""

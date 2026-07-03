@@ -20,7 +20,8 @@ from .analysis import JCC, RET, X86_OP_IMM, X86_OP_REG, X86_OP_MEM, ST_REGS
 from . import encoder as E
 from .encoder import Mem
 
-ABS32_MODULE, REL32_MODULE, REL32_HELPER, ABS32_DATA = range(4)
+ABS32_MODULE, REL32_MODULE, REL32_HELPER, ABS32_DATA, \
+    TEB_FP, TEB_AH, ABS32_BLOB = range(7)
 
 # helper ids (must match runtime)
 H_SIN, H_COS, H_SINCOS, H_TAN, H_ATAN2, H_YL2X, H_YL2XP1, H_2XM1, \
@@ -48,12 +49,13 @@ class TranslateError(Exception):
 
 class Item:
     """One emitted chunk: raw bytes with fixups, or a branch placeholder."""
-    __slots__ = ("data", "fixups", "branch")
+    __slots__ = ("data", "fixups", "branch", "jt")
 
-    def __init__(self, data=b"", fixups=None, branch=None):
+    def __init__(self, data=b"", fixups=None, branch=None, jt=None):
         self.data = data
         self.fixups = fixups or []   # (off, type, arg)
         self.branch = branch         # (kind, cc_byte, target_va) kind: jmp/jcc/call
+        self.jt = jt                 # jump-table jmp: original jmp VA
 
 
 class FuncTranslator:
@@ -86,6 +88,37 @@ class FuncTranslator:
         m = Mem(disp=0)
         data, doff = E.sse_rm(prefix_opc[0], prefix_opc[1], reg, m)
         self.emit(data, [(doff, ABS32_DATA, data_off)])
+
+    # ------------- TEB scratch (fs:) accessors -------------
+    def teb_movsd_store(self, x):
+        """movsd fs:[TEB_FP], xmm_x"""
+        self.emit(bytes([0x64, 0xF2, 0x0F, 0x11, 0x05 | (x << 3), 0, 0, 0, 0]),
+                  [(5, TEB_FP, 0)])
+
+    def teb_movsd_load(self, x):
+        self.emit(bytes([0x64, 0xF2, 0x0F, 0x10, 0x05 | (x << 3), 0, 0, 0, 0]),
+                  [(5, TEB_FP, 0)])
+
+    def teb_fld(self):
+        self.emit(b"\x64\xDD\x05\x00\x00\x00\x00", [(3, TEB_FP, 0)])
+
+    def teb_fstp(self):
+        self.emit(b"\x64\xDD\x1D\x00\x00\x00\x00", [(3, TEB_FP, 0)])
+
+    def spill_before_call(self, d):
+        """Carry xmm slots 0..d-1 across a call on the real x87 stack,
+        exactly reproducing the original FPU stack the callee saw."""
+        for i in range(d):
+            self.teb_movsd_store(i)
+            self.teb_fld()
+
+    def reload_after_call(self, d, returns_st0):
+        if returns_st0:
+            self.teb_fstp()
+            self.teb_movsd_load(d)
+        for i in range(d - 1, -1, -1):
+            self.teb_fstp()
+            self.teb_movsd_load(i)
 
     # ------------- helpers -------------
     def _free_gp(self, mem):
@@ -151,11 +184,16 @@ class FuncTranslator:
             if tgt in self.ci_funcs:
                 self.ci_call(self.ci_funcs[tgt][0], d, t)
                 return
+            returns_st0 = va in fi.call_returns
+            if d > 0:
+                self.spill_before_call(d)
             if tgt is not None:
                 self.emit_branch("call", None, tgt)
             else:
                 self.copy(va, ins)  # indirect call: copy verbatim
-            if va in fi.call_returns:
+            if d > 0:
+                self.reload_after_call(d, returns_st0)
+            elif returns_st0:
                 # callee returned a value in st0: move it to xmm slot 0
                 self.emit(E.lea_esp(-8))
                 self.emit(E.FSTP_QWORD_ESP)
@@ -174,6 +212,16 @@ class FuncTranslator:
             return
 
         if mnem in ("jmp", "ljmp"):
+            if va in fi.jumptables:
+                # rebuilt pointer table lives at the end of the blob; the
+                # disp32 (and each entry) gets an ABS32_BLOB fixup whose arg
+                # is assigned during layout
+                mem = Mem.from_op(ins.operands[0])
+                mem.disp = 0
+                enc, doff = mem.encode(4)   # FF /4
+                self.items.append(Item(b"\xFF" + enc,
+                                       [(1 + doff, ABS32_BLOB, -1)], jt=va))
+                return
             self.emit_branch("jmp", None, ins.operands[0].imm)
             return
 
@@ -207,7 +255,9 @@ class FuncTranslator:
             self.copy(va, ins)
             return
         if mnem in ("fnstsw", "fstsw"):
-            self.emit(E_.LAHF)
+            # AH := low byte of the EFLAGS snapshot taken at the compare
+            # (same layout as lahf); does not read or write EFLAGS.
+            self.emit(b"\x64\x8A\x25\x00\x00\x00\x00", [(3, TEB_AH, 0)])
             return
         if mnem in ("fnstcw", "fstcw"):
             self.copy(va, ins)
@@ -428,6 +478,11 @@ class FuncTranslator:
             else:
                 i = sts[-1] if sts else 1
                 self.emit(E_.sse_rr(*E_.UCOMISD, X(t), X(t - i)))
+            # snapshot EFLAGS to TEB so any later fnstsw can read this
+            # compare's result regardless of intervening flag writers
+            # (pushfd + pop dword fs:[TEB]; touches no registers)
+            self.emit(b"\x9C")
+            self.emit(b"\x64\x8F\x05\x00\x00\x00\x00", [(3, TEB_AH, 0)])
             return
 
         if mnem == "fsin":
@@ -493,6 +548,13 @@ class FuncTranslator:
                 pos += 6 if kind == "jcc" else 5
             else:
                 pos += len(it.data)
+        # rebuilt jump-table pointer arrays go at the end, 4-aligned
+        pos = (pos + 3) & ~3
+        table_off = {}
+        for it in self.items:
+            if it.jt is not None:
+                table_off[it.jt] = pos
+                pos += 4 * len(self.fi.jumptables[it.jt][1])
         total = pos
         # map original VA -> blob offset
         va2off = {va: offs[idx] for va, idx in self.va_index.items()}
@@ -520,6 +582,13 @@ class FuncTranslator:
             else:
                 blob += it.data
                 for off, typ, arg in it.fixups:
+                    if typ == ABS32_BLOB and it.jt is not None:
+                        arg = table_off[it.jt]
                     fixups.append((base + off, typ, arg))
-        assert len(blob) == total
+        blob += b"\x00" * (((len(blob) + 3) & ~3) - len(blob))
+        for jt_va, toff in sorted(table_off.items(), key=lambda kv: kv[1]):
+            for k, tgt in enumerate(self.fi.jumptables[jt_va][1]):
+                blob += b"\x00\x00\x00\x00"
+                fixups.append((toff + 4 * k, ABS32_BLOB, va2off[tgt]))
+        assert len(blob) == total, (len(blob), total)
         return bytes(blob), fixups

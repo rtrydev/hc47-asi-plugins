@@ -22,7 +22,32 @@ typedef struct {
 typedef struct { uint32_t rva, blob_off, blob_len, fixup_idx, n_fixups; } FuncRec;
 typedef struct { uint32_t blob_off, arg, type; } FixupRec;
 #pragma pack(pop)
-enum { ABS32_MODULE, REL32_MODULE, REL32_HELPER, ABS32_DATA };
+enum { ABS32_MODULE, REL32_MODULE, REL32_HELPER, ABS32_DATA,
+       TEB_FP, TEB_AH, ABS32_BLOB };
+
+static uint32_t g_teb_fp_disp, g_teb_ah_disp;
+
+static int alloc_teb_scratch(void)
+{
+    char owned[64] = {0};
+    DWORD slots[64]; int n = 0;
+    for (int i = 0; i < 64; i++) {
+        DWORD s = TlsAlloc();
+        if (s == TLS_OUT_OF_INDEXES) break;
+        slots[n++] = s;
+        if (s < 64) owned[s] = 1;
+    }
+    int base = -1;
+    for (int i = 0; i + 2 < 64; i++)
+        if (owned[i] && owned[i + 1] && owned[i + 2]) { base = i; break; }
+    for (int i = 0; i < n; i++)
+        if (base < 0 || slots[i] < (DWORD)base || slots[i] > (DWORD)base + 2)
+            TlsFree(slots[i]);
+    if (base < 0) return 0;
+    g_teb_fp_disp = 0xE10 + base * 4;
+    g_teb_ah_disp = 0xE10 + (base + 2) * 4;
+    return 1;
+}
 
 typedef struct {
     double zero, one, pi, l2e, l2t, lg2, ln2, _pad;
@@ -51,10 +76,11 @@ extern uint32_t call_probe(void *fn, uint32_t ecx, uint32_t edx,
 
 /* ---- crash guard ---- */
 static jmp_buf g_jb;
-static volatile uint32_t g_fault_code;
+static volatile uint32_t g_fault_code, g_fault_addr;
 static LONG CALLBACK veh(EXCEPTION_POINTERS *ep)
 {
     g_fault_code = ep->ExceptionRecord->ExceptionCode;
+    g_fault_addr = (uint32_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress;
     longjmp(g_jb, 1);
 }
 
@@ -87,13 +113,44 @@ static void fill_scratch(uint32_t seed)
 }
 
 typedef struct {
-    uint32_t eax, edx, st0_flag, faulted, fault_code;
+    uint32_t eax, edx, st0_flag, faulted, fault_code, fault_addr;
     double st0;
     uint32_t mem_hash_exact;
 } Result;
 
+/* pristine copy of the module's writable sections: functions may mutate
+ * module globals, which would leak state from the orig run into the xlat
+ * run and cause false mismatches */
+static uint8_t *g_wsec_base[32];
+static uint8_t *g_wsec_copy[32];
+static uint32_t g_wsec_size[32];
+static int g_n_wsec;
+
+static void snapshot_writable(uint8_t *base)
+{
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    IMAGE_NT_HEADERS32 *nt = (IMAGE_NT_HEADERS32 *)(base + dos->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections && g_n_wsec < 32; i++) {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+        uint32_t sz = sec[i].Misc.VirtualSize;
+        g_wsec_base[g_n_wsec] = base + sec[i].VirtualAddress;
+        g_wsec_size[g_n_wsec] = sz;
+        g_wsec_copy[g_n_wsec] = malloc(sz);
+        memcpy(g_wsec_copy[g_n_wsec], g_wsec_base[g_n_wsec], sz);
+        g_n_wsec++;
+    }
+}
+
+static void restore_writable(void)
+{
+    for (int i = 0; i < g_n_wsec; i++)
+        memcpy(g_wsec_base[i], g_wsec_copy[i], g_wsec_size[i]);
+}
+
 static void run_one(void *fn, uint32_t seed, Result *res, uint32_t *mem_out)
 {
+    restore_writable();
     memcpy(g_scratch, g_scratch_init, sizeof(g_scratch));
     g_seed = seed ^ 0x9E3779B9u;
     uint32_t args[16];
@@ -114,6 +171,7 @@ static void run_one(void *fn, uint32_t seed, Result *res, uint32_t *mem_out)
     if (setjmp(g_jb)) {
         res->faulted = 1;
         res->fault_code = g_fault_code;
+        res->fault_addr = g_fault_addr;
         return;
     }
     res->eax = call_probe(fn, ecx, edx, args, 16,
@@ -144,10 +202,12 @@ int main(int argc, char **argv)
     g_helpers[8] = hlp_scale; g_helpers[9] = hlp_rndint;
     g_helpers[10] = hlp_i64tod; g_helpers[11] = hlp_dtoi64;
 
+    if (!alloc_teb_scratch()) { printf("FAIL: TEB scratch\n"); return 2; }
     HMODULE mod = LoadLibraryExA(argv[1], NULL, DONT_RESOLVE_DLL_REFERENCES);
     if (!mod) { printf("FAIL: cannot load %s (%lu)\n", argv[1], GetLastError()); return 2; }
     uint8_t *base = (uint8_t *)((uintptr_t)mod & ~0xFFFu);
     printf("module at %p\n", (void *)base);
+    snapshot_writable(base);
 
     FILE *pf = fopen(argv[2], "rb");
     if (!pf) { printf("FAIL: patch file\n"); return 2; }
@@ -179,6 +239,11 @@ int main(int argc, char **argv)
             break;
         case ABS32_DATA:
             *p32 = (uint32_t)(uintptr_t)((uint8_t *)&g_data + fixups[i].arg);
+            break;
+        case TEB_FP: *p32 = g_teb_fp_disp; break;
+        case TEB_AH: *p32 = g_teb_ah_disp; break;
+        case ABS32_BLOB:
+            *p32 = (uint32_t)(uintptr_t)(blob + fixups[i].arg);
             break;
         }
     }
@@ -215,9 +280,11 @@ int main(int argc, char **argv)
             run_one(xlat, seed, &rb, memB);
             if (ra.faulted || rb.faulted) {
                 if (ra.faulted != rb.faulted) {
-                    printf("MISMATCH %05x r%d: fault orig=%u(%08x) xlat=%u(%08x)\n",
+                    printf("MISMATCH %05x r%d: fault orig=%u(%08x@%08x) "
+                           "xlat=%u(%08x@%08x) [mod=%p blob=%p]\n",
                            leaf[i], round, ra.faulted, ra.fault_code,
-                           rb.faulted, rb.fault_code);
+                           ra.fault_addr, rb.faulted, rb.fault_code,
+                           rb.fault_addr, (void *)base, blob);
                     func_ok = 0;
                 }
                 continue;  /* both faulted: inconclusive round */

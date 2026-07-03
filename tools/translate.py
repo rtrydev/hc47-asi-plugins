@@ -100,6 +100,8 @@ def main():
         func_recs.append((f.start - mod.base, blob_off, len(blob),
                           len(fixup_recs), len(fixups)))
         for off, typ, arg in fixups:
+            if typ == 6:  # ABS32_BLOB: arg is function-local, make it global
+                arg += blob_off
             fixup_recs.append((blob_off + off, arg & 0xFFFFFFFF, typ))
         blob_parts.append(blob)
         blob_off += len(blob)

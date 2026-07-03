@@ -37,7 +37,34 @@ typedef struct {
 } FixupRec;
 #pragma pack(pop)
 
-enum { ABS32_MODULE = 0, REL32_MODULE = 1, REL32_HELPER = 2, ABS32_DATA = 3 };
+enum { ABS32_MODULE = 0, REL32_MODULE = 1, REL32_HELPER = 2, ABS32_DATA = 3,
+       TEB_FP = 4, TEB_AH = 5, ABS32_BLOB = 6 };
+
+/* TEB scratch: 3 consecutive TLS slots (8-byte FP shuttle + AH snapshot),
+ * addressed as fs:[0xE10 + slot*4]. Thread-safe, no registers needed. */
+static uint32_t g_teb_fp_disp, g_teb_ah_disp;
+
+static int alloc_teb_scratch(void)
+{
+    char owned[64] = {0};
+    DWORD slots[64]; int n = 0;
+    for (int i = 0; i < 64; i++) {
+        DWORD s = TlsAlloc();
+        if (s == TLS_OUT_OF_INDEXES) break;
+        slots[n++] = s;
+        if (s < 64) owned[s] = 1;
+    }
+    int base = -1;
+    for (int i = 0; i + 2 < 64; i++)
+        if (owned[i] && owned[i + 1] && owned[i + 2]) { base = i; break; }
+    for (int i = 0; i < n; i++)
+        if (base < 0 || slots[i] < (DWORD)base || slots[i] > (DWORD)base + 2)
+            TlsFree(slots[i]);
+    if (base < 0) return 0;
+    g_teb_fp_disp = 0xE10 + base * 4;
+    g_teb_ah_disp = 0xE10 + (base + 2) * 4;
+    return 1;
+}
 
 /* ---- constant/data area referenced by translated code (ABS32_DATA) ----
  * Layout must match tools/hc47x87/codegen.py. 16-byte aligned. */
@@ -162,6 +189,15 @@ static int apply_patch(Pending *p, HMODULE mod)
             break;
         case ABS32_DATA:
             *p32 = (uint32_t)(uintptr_t)((uint8_t *)&g_data + fixups[i].arg);
+            break;
+        case TEB_FP:
+            *p32 = g_teb_fp_disp;
+            break;
+        case TEB_AH:
+            *p32 = g_teb_ah_disp;
+            break;
+        case ABS32_BLOB:
+            *p32 = (uint32_t)(uintptr_t)(blob + fixups[i].arg);
             break;
         }
     }
@@ -289,6 +325,13 @@ static void init(HMODULE self)
         logf_("no patch files found in %s\\HC47ReducedX87", g_dir);
         return;
     }
+
+    if (!alloc_teb_scratch()) {
+        logf_("FATAL: no 3 consecutive TLS slots; not patching");
+        g_n_pending = 0;
+        return;
+    }
+    logf_("TEB scratch at fs:[0x%X]", g_teb_fp_disp);
 
     check_pending();  /* modules that are already loaded */
 
