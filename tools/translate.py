@@ -66,7 +66,7 @@ def main():
     _, funcs0 = analysis.analyze_module(mod)
     ftol = set(find_ftol(mod, funcs0))
     ci = find_ci(mod, funcs0)
-    an, funcs = analysis.analyze_module(mod, ftol_vas=ftol, ci_funcs=ci)
+    an, funcs = analysis.analyze_full(mod, ftol, ci)
 
     # never hook the CRT helpers themselves (their callers are rewritten)
     helper_vas = ftol | set(ci)

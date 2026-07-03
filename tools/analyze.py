@@ -107,7 +107,7 @@ def main():
     print(f"_CI candidates:   {{{', '.join(f'{hex(v)}: {n[0]}' for v, n in ci.items())}}}")
 
     # pass 2: with helper knowledge
-    an, funcs = analysis.analyze_module(mod, ftol_vas=ftol, ci_funcs=ci)
+    an, funcs = analysis.analyze_full(mod, ftol, ci)
     print(analysis.coverage_report(mod, funcs, total_x87))
     print("\nx87 mnemonic census (top 25):")
     for m, n in hist.most_common(25):

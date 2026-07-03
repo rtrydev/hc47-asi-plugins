@@ -82,6 +82,7 @@ class FuncInfo:
         self.flagsrc = {}           # fnstsw VA -> producing compare VA
         self.fnstsw_kind = {}       # fnstsw VA -> 'fresh' | 'stale'
         self.jumptables = {}        # jmp VA -> (table_va, [target VAs])
+        self.ret_depths = set()     # x87 depth at each ret
 
 
 # EFLAGS read/write masks from capstone metadata
@@ -119,10 +120,13 @@ def required_depth(mnem, ins):
 
 
 class Analyzer:
-    def __init__(self, mod, ftol_vas=(), ci_funcs=None):
+    def __init__(self, mod, ftol_vas=(), ci_funcs=None, callee_ret=None):
         self.mod = mod
         self.ftol_vas = set(ftol_vas)
         self.ci_funcs = ci_funcs or {}   # va -> ('sin'|'cos'|..., nargs, nret)
+        # va -> 0 (returns with empty x87 stack) | 1 (returns value in st0);
+        # absent = unknown. Built interprocedurally from a previous pass.
+        self.callee_ret = callee_ret or {}
         self.starts = self.discover()
 
     # ---------------- discovery ----------------
@@ -174,6 +178,7 @@ class Analyzer:
                 fi.insns.clear(); fi.depth_in.clear(); fi.order = []
                 fi.leaders.clear(); fi.flagsrc.clear()
                 fi.fnstsw_kind.clear(); fi.jumptables.clear()
+                fi.ret_depths.clear()
                 fi.n_x87 = 0; fi.max_depth = 0; fi.end = fi.start
                 continue
             except Reject as r:
@@ -227,13 +232,6 @@ class Analyzer:
             prev = state.get(va)
             if prev is not None:
                 if prev[0] != st[0]:
-                    # one path may be missing an st0-returning call mark
-                    lo, hi = (st, prev) if st[0] < prev[0] else (prev, st)
-                    lc = lo[1]
-                    if hi[0] == lo[0] + 1 and lc is not None \
-                            and lc not in fi.call_returns:
-                        fi.call_returns.add(lc)
-                        raise _RetryWalk()
                     raise Reject("depth-merge")
                 merged = (
                     st[0],
@@ -296,11 +294,25 @@ class Analyzer:
                 else:
                     # depth > 0 is fine: live slots are carried across the
                     # call on the real x87 stack (codegen spill/reload)
-                    if va in fi.call_returns:
+                    kr = self.callee_ret.get(tgt) if tgt is not None else None
+                    if kr == 1:
+                        # callee provably returns a value in st0
+                        fi.call_returns.add(va)
                         depth += 1
                         if depth > 7:
                             raise Reject("depth8")
-                    last_call = va
+                        last_call = None
+                    elif kr == 0:
+                        # callee provably returns with an empty x87 stack:
+                        # it can never be marked as an st0 source
+                        fi.call_returns.discard(va)
+                        last_call = None
+                    else:
+                        if va in fi.call_returns:
+                            depth += 1
+                            if depth > 7:
+                                raise Reject("depth8")
+                        last_call = va
                 work.append((nxt, (depth, last_call, None, True, va, None)))
                 continue
 
@@ -310,6 +322,7 @@ class Analyzer:
             if mnem in RET:
                 if depth not in (0, 1):
                     raise Reject("ret-depth")
+                fi.ret_depths.add(depth)
                 continue
 
             st2 = (depth, last_call, last_cmp, flags_ok, owner, ah_saved)
@@ -508,8 +521,8 @@ class _RetryWalk(Exception):
     pass
 
 
-def analyze_module(mod, ftol_vas=(), ci_funcs=None):
-    an = Analyzer(mod, ftol_vas, ci_funcs)
+def analyze_module(mod, ftol_vas=(), ci_funcs=None, callee_ret=None):
+    an = Analyzer(mod, ftol_vas, ci_funcs, callee_ret)
     funcs = []
     starts = [s for s in an.starts if mod.in_text(s)]
     an.starts = starts
@@ -520,6 +533,29 @@ def analyze_module(mod, ftol_vas=(), ci_funcs=None):
                 if ts <= s < te:
                     bound = te
         funcs.append(an.analyze_function(s, bound))
+    return an, funcs
+
+
+def ret_depth_map(funcs):
+    """va -> 0|1 for functions whose walk completed with a uniform ret depth."""
+    out = {}
+    for f in funcs:
+        if f.status in ("ok", "nofp") and len(f.ret_depths) == 1:
+            out[f.start] = next(iter(f.ret_depths))
+    return out
+
+
+def analyze_full(mod, ftol_vas, ci_funcs, iterations=3):
+    """Iterate analysis so interprocedural st0-return knowledge reaches a
+    fixpoint: each pass unlocks functions whose ret depth informs the next."""
+    callee_ret = {}
+    an = funcs = None
+    for _ in range(iterations):
+        an, funcs = analyze_module(mod, ftol_vas, ci_funcs, callee_ret)
+        new_map = ret_depth_map(funcs)
+        if new_map == callee_ret:
+            break
+        callee_ret = new_map
     return an, funcs
 
 

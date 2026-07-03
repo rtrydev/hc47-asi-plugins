@@ -14,7 +14,7 @@ def main():
     _, funcs0 = analysis.analyze_module(mod)
     ftol = set(find_ftol(mod, funcs0))
     ci = find_ci(mod, funcs0)
-    _, funcs = analysis.analyze_module(mod, ftol_vas=ftol, ci_funcs=ci)
+    _, funcs = analysis.analyze_full(mod, ftol, ci)
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                        "dist", module + ".leaf.txt")
     n = 0
