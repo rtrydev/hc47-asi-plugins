@@ -372,12 +372,14 @@ class Analyzer:
             raise Reject("jt-table-loc")
 
         # scan back for the bounding `cmp <reg>, imm` and optional byte-table
-        # movzx between it and the jmp
+        # movzx between it and the jmp. The cmp must be on the index register
+        # (or the byte-table index) or the bound is meaningless.
         import struct
         bound = None
         byte_table = None
         scan = []
         back = va
+        cmp_reg = None
         for _ in range(8):
             prevs = [p for p in fi.insns if p < back and
                      p + fi.insns[p].size == back]
@@ -387,16 +389,26 @@ class Analyzer:
             scan.append(fi.insns[back])
             if fi.insns[back].mnemonic == "cmp":
                 ops = fi.insns[back].operands
-                if len(ops) == 2 and ops[1].type == X86_OP_IMM:
+                if len(ops) == 2 and ops[0].type == X86_OP_REG and \
+                        ops[1].type == X86_OP_IMM:
                     bound = ops[1].imm
+                    cmp_reg = ops[0].reg
                 break
         if bound is None or not (0 <= bound < 4096):
             raise Reject("jt-nobound")
+        index_regs = {m.index}
         for s in scan:
             if s.mnemonic == "movzx" and len(s.operands) == 2 and \
                     s.operands[1].type == X86_OP_MEM and \
                     s.operands[1].size == 1:
                 byte_table = s.operands[1].mem.disp & 0xFFFFFFFF
+                index_regs.add(s.operands[1].mem.index)
+        # match on register name modulo width (cmp al/ax/eax variants)
+        rn = self.mod.md.reg_name
+        names = {rn(r).lstrip("e").replace("l", "x") for r in index_regs if r}
+        cn = rn(cmp_reg).lstrip("e").replace("l", "x") if cmp_reg else None
+        if cn is None or cn not in names:
+            raise Reject("jt-cmpreg")
 
         if byte_table is not None:
             raw = mod.read(byte_table, bound + 1)
