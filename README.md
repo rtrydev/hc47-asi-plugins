@@ -88,6 +88,40 @@ Built by `make` in `runtime/`, installed by `install.sh`. Log:
 `scripts/HC47HudScale.log`. Diagnostic tooling used to reverse the GUI
 pipeline lives in `runtime/rtrace.c` (`make rtrace`).
 
+## HUD extras (`HC47HudExtras.asi`)
+
+A third ASI adds three quality-of-life features:
+
+- **CrosshairScale** — shrinks the aiming crosshair / center dot. The
+  crosshair is a set of `ZWINOBJ` GUI sprites (`CrossHair_02-*` from
+  `Bitmaps/Pointers`); the ASI resolves them by name in the engine object
+  database each level and calls the native `SetScale` virtual.
+- **Mission timer** — `mm:ss` since mission start, rendered with the
+  game's own HUD font (`BankGothic10` / BNKGOTHL.TTF) as a `ZCHAROBJ`
+  label parented to the in-game `IngameDisplay` window. Time source is the
+  engine's global clock (`ZSysInterface+0x37c5`), latched at
+  `LevelControl::Init` (runs on every mission start/restart). C47 saves
+  are progress-only — no mid-mission state exists — so a timer that
+  restarts with the mission matches engine semantics. Note: the clock
+  keeps running while the pause menu is open.
+- **FPS readout** — second label below the timer, computed from the
+  engine's own frame timestamps.
+
+Config: `scripts/HC47HudExtras.ini`
+
+```ini
+[HudExtras]
+CrosshairScale=0.5   ; 1.0 leaves the crosshair untouched
+ShowTimer=1
+ShowFPS=1
+TextX=10             ; overlay position in virtual GUI pixels
+TextY=100            ; (just below the top-left HUD)
+LineGap=16
+```
+
+Log: `scripts/HC47HudExtras.log`. All hooks are byte-checked; a mismatch
+disables only the affected feature.
+
 ## Precision notes ("reduced precision")
 
 Translated code computes in 64-bit doubles instead of 80-bit extended

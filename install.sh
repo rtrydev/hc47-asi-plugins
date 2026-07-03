@@ -10,7 +10,9 @@ if [ "$1" = "-u" ]; then
     rm -f "$GAME/scripts/HC47ReducedX87.log"
     rm -f "$GAME/scripts/HC47HudScale.asi"
     rm -f "$GAME/scripts/HC47HudScale.log"
-    # HC47HudScale.ini is user config; left in place on purpose
+    rm -f "$GAME/scripts/HC47HudExtras.asi"
+    rm -f "$GAME/scripts/HC47HudExtras.log"
+    # HC47HudScale.ini / HC47HudExtras.ini are user config; left in place on purpose
     echo "uninstalled"
     exit 0
 fi
@@ -27,6 +29,14 @@ if [ -f "$HERE/dist/HC47HudScale.asi" ]; then
     cp "$HERE/dist/HC47HudScale.asi" "$GAME/scripts/"
     if [ ! -f "$GAME/scripts/HC47HudScale.ini" ]; then
         printf '[HudScale]\nScale=2.0\n' > "$GAME/scripts/HC47HudScale.ini"
+    fi
+fi
+
+# HUD extras: crosshair shrink + mission timer + FPS overlay
+if [ -f "$HERE/dist/HC47HudExtras.asi" ]; then
+    cp "$HERE/dist/HC47HudExtras.asi" "$GAME/scripts/"
+    if [ ! -f "$GAME/scripts/HC47HudExtras.ini" ]; then
+        printf '[HudExtras]\nCrosshairScale=0.5\nShowTimer=1\nShowFPS=1\nTextX=10\nTextY=100\nLineGap=16\n' > "$GAME/scripts/HC47HudExtras.ini"
     fi
 fi
 
