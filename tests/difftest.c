@@ -149,6 +149,8 @@ static void restore_writable(void)
         memcpy(g_wsec_base[i], g_wsec_copy[i], g_wsec_size[i]);
 }
 
+static uint32_t g_last_args[16];
+
 static void run_one(void *fn, uint32_t seed, Result *res, uint32_t *mem_out)
 {
     restore_writable();
@@ -176,6 +178,7 @@ static void run_one(void *fn, uint32_t seed, Result *res, uint32_t *mem_out)
         } else
             args[i] = rnd() % 64;
     }
+    memcpy(g_last_args, args, sizeof(args));
     uint32_t ecx = (uint32_t)(uintptr_t)&g_scratch[rnd() % (SCRATCH_WORDS / 2)];
     uint32_t edx = (uint32_t)(uintptr_t)&g_scratch[rnd() % (SCRATCH_WORDS / 2)];
 
@@ -327,9 +330,18 @@ int main(int argc, char **argv)
             }
             if (ra.st0_flag != rb.st0_flag ||
                 (ra.st0_flag && !dbl_close(ra.st0, rb.st0))) {
-                printf("MISMATCH %05x r%d: st0 [%d]%g vs [%d]%g\n",
+                printf("MISMATCH %05x r%d: st0 [%d]%.17g vs [%d]%.17g\n",
                        leaf[i], round, ra.st0_flag, ra.st0,
                        rb.st0_flag, rb.st0);
+                printf("  args:");
+                for (int j = 0; j < 16; j++)
+                    printf(" %08x", g_last_args[j]);
+                printf("\n  as doubles:");
+                for (int j = 0; j + 1 < 16; j += 2) {
+                    double d; memcpy(&d, &g_last_args[j], 8);
+                    printf(" [%d]=%.17g", j, d);
+                }
+                printf("\n");
                 func_ok = 0;
             }
             /* memory: float-tolerant compare */
@@ -345,9 +357,9 @@ int main(int argc, char **argv)
             }
         }
         tested++;
-        if (!func_ran) { faults++; continue; }
-        if (func_ok) passed++;
-        else mism++;
+        if (!func_ran) { faults++; fprintf(stderr, "VERDICT %05x FAULT\n", leaf[i]); continue; }
+        if (func_ok) { passed++; fprintf(stderr, "VERDICT %05x PASS\n", leaf[i]); }
+        else { mism++; fprintf(stderr, "VERDICT %05x MISM\n", leaf[i]); }
     }
     printf("\n=== %d tested: %d passed, %d mismatched, %d all-fault, %d no-blob"
            " (%d fnstsw-junk rounds tolerated) ===\n",
