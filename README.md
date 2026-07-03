@@ -59,6 +59,35 @@ python3 tools/gen_manifest.py HitmanDlc.dlc
 # bottle's wine (see tests/run.sh)
 ```
 
+## HUD scale (`HC47HudScale.asi`)
+
+A second, independent ASI in this repo scales the game's entire 2D layer
+(menus, HUD, text, cursor) natively — in **any** window mode (exclusive
+fullscreen, borderless, windowed), unlike the dgVoodoo `Resolution = 2x`
+trick which only works in exclusive fullscreen.
+
+How: the engine GUI lays itself out in pixels against the resolution ints
+stored in `ZSysInterface` (`g_pSysInterface` from Globals.dll, width at
++0x19 / height at +0x1d). Every pixel→normalized conversion, anchor
+computation and culling test in `HitmanDlc.dlc` uses those two fields,
+while the renderer maps normalized coordinates onto its own copy of the
+real mode taken at mode-set time. `HC47HudScale.asi` waits for the display
+mode to be established, then keeps `width/Scale, height/Scale` pinned into
+the ZSysInterface fields — the GUI lays out for a smaller virtual screen
+and the renderer stretches it to the real one. 3D rendering, resolution and
+window mode are untouched.
+
+Config: `scripts/HC47HudScale.ini`
+
+```ini
+[HudScale]
+Scale=2.0    ; 1.0 disables; fractional values (1.5) work
+```
+
+Built by `make` in `runtime/`, installed by `install.sh`. Log:
+`scripts/HC47HudScale.log`. Diagnostic tooling used to reverse the GUI
+pipeline lives in `runtime/rtrace.c` (`make rtrace`).
+
 ## Precision notes ("reduced precision")
 
 Translated code computes in 64-bit doubles instead of 80-bit extended
