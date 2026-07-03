@@ -19,10 +19,26 @@
  * Config: scripts/HC47HudScale.ini
  *   [HudScale]
  *   Scale=2.0        ; 1.0 = off; fractional values fine (e.g. 1.5)
+ *   SharpText=1      ; re-rasterize TTF fonts at the real pixel size
  *
  * A watchdog re-applies the virtual size if the game rewrites the fields
  * (mode change from the options menu re-runs apply-settings, which copies
  * the current mode back over them).
+ *
+ * SharpText: menu/HUD text comes from TrueType fonts rasterized at load
+ * time by a FreeType build embedded in HitmanDlc.dlc (class ZTTFONT).
+ * The pixel size passed to FT_Set_Char_Size is the FontSize long from the
+ * GUI resource (object +0x26c) — i.e. a size in *virtual* pixels, so with
+ * Scale=2 the glyphs would be rasterized small and magnified 2x (blurry).
+ * Two byte-checked patches (both verified against this exact game build):
+ *  1. ZTTFONT lazy init (RVA 0x8cf2b): multiply the FT_Set_Char_Size pixel
+ *     size by Scale — glyphs rasterize 1:1 with real screen pixels.
+ *  2. The shared label glyph-geometry builder (RVA 0x5e250): labels
+ *     (ZCHAROBJ etc.) multiply their own render-scale doubles into every
+ *     glyph vertex; an entry hook computes an effective scale (divided by
+ *     Scale when the label's font is a ZTTFONT) into globals, and the
+ *     builder's 16 fmul sites are retargeted to those globals.
+ * Net effect: crisp text at the original layout size, for any Scale.
  */
 #include <windows.h>
 #include <stdio.h>
@@ -38,9 +54,23 @@
 #define SI_CURW    0x21   /* int32: current mode width  (set by renderer) */
 #define SI_CURH    0x25   /* int32: current mode height (set by renderer) */
 
+/* ZTTFONT lazy-init in HitmanDlc.dlc (build stamp 0x3A3E13D1) */
+#define DLC_TIMESTAMP    0x3a3e13d1
+#define DLC_SIZEOFIMAGE  0x274000
+#define TTF_SIZE_RVA     0x8cf2b   /* mov ecx,[esi+0x26c] (6 bytes) */
+static const uint8_t TTF_SIZE_BYTES[6] = { 0x8b, 0x8e, 0x6c, 0x02, 0x00, 0x00 };
+#define ZFONT_SCALEX_OFF 0xd7      /* double, multiplied into glyph verts */
+#define ZFONT_SCALEY_OFF 0xdf
+#define ZTTFONT_VTBL_RVA 0x1fbfcc  /* ZTTFONT (FreeType font resource) vtable */
+#define BUILDER_RVA      0x5e250   /* shared label glyph-geometry builder */
+#define LABEL_FONT_OFF   0x10b     /* label -> font-ish object (charset?) */
+#define LABEL_FONT2_OFF  0x20f     /* label -> glyph provider (GetGlyph target) */
+
 static FILE *g_log;
 static float g_scale = 1.0f;
+static int g_sharptext = 1;
 static char g_dir[MAX_PATH];
+static double g_invscale = 1.0;    /* referenced from the stub */
 
 static void logf_(const char *fmt, ...)
 {
@@ -63,9 +93,13 @@ static float read_scale(void)
     char line[128];
     while (fgets(line, sizeof(line), f)) {
         float v;
+        int b;
         if (sscanf(line, " Scale = %f", &v) == 1 ||
             sscanf(line, " Scale=%f", &v) == 1)
             scale = v;
+        else if (sscanf(line, " SharpText = %d", &b) == 1 ||
+                 sscanf(line, " SharpText=%d", &b) == 1)
+            g_sharptext = b;
     }
     fclose(f);
     if (!(scale >= 0.5f && scale <= 8.0f)) scale = 1.0f;
@@ -81,14 +115,168 @@ static uint8_t *sysiface(void)
     return (pp && *pp) ? *pp : NULL;
 }
 
+static double g_eff_sx = 1.0, g_eff_sy = 1.0;  /* read by patched fmuls */
+static uint32_t g_zttfont_vtbl;
+
+/* called from the builder entry thunk; regs = pushad block
+ * (EDI ESI EBP ESP EBX EDX ECX EAX ascending), ecx = label object */
+void __cdecl builder_entry(uint32_t *regs)
+{
+    uint8_t *label = (uint8_t *)regs[6];
+    double sx, sy;
+    memcpy(&sx, label + ZFONT_SCALEX_OFF, 8);
+    memcpy(&sy, label + ZFONT_SCALEY_OFF, 8);
+    uint8_t *f1 = *(uint8_t **)(label + LABEL_FONT_OFF);
+    uint8_t *f2 = *(uint8_t **)(label + LABEL_FONT2_OFF);
+    int ttf = (f1 && !IsBadReadPtr(f1, 4) && *(uint32_t *)f1 == g_zttfont_vtbl) ||
+              (f2 && !IsBadReadPtr(f2, 4) && *(uint32_t *)f2 == g_zttfont_vtbl);
+    if (ttf) {
+        sx *= g_invscale;
+        sy *= g_invscale;
+    }
+#ifdef HUDSCALE_DEBUG
+    {
+        static LONG dbg_n;
+        if (InterlockedIncrement(&dbg_n) <= 40)
+            logf_("builder: label=%p vt=%08x f1=%p(%08x) f2=%p(%08x) ttf=%d s=(%.3f,%.3f)",
+                  label, *(uint32_t *)label,
+                  f1, f1 && !IsBadReadPtr(f1,4) ? *(uint32_t *)f1 : 0,
+                  f2, f2 && !IsBadReadPtr(f2,4) ? *(uint32_t *)f2 : 0,
+                  ttf, sx, sy);
+    }
+#endif
+    g_eff_sx = sx;
+    g_eff_sy = sy;
+}
+
+/* ---- SharpText: patch ZTTFONT size selection ----
+ * stub replacing `mov ecx,[esi+0x26c]`:
+ *   mov ecx,[esi+0x26c]
+ *   imul ecx,ecx,S4096        ; S4096 = round(Scale*4096)
+ *   add ecx,0x800
+ *   sar ecx,12                ; ecx = round(FontSize*Scale)
+ *   jmp back
+ */
+static int patch_sharptext(void)
+{
+    HMODULE dlc = GetModuleHandleA("HitmanDlc.dlc");
+    if (!dlc) return 0;
+    uint8_t *base = (uint8_t *)dlc;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    IMAGE_NT_HEADERS32 *nt = (IMAGE_NT_HEADERS32 *)(base + dos->e_lfanew);
+    if (nt->FileHeader.TimeDateStamp != DLC_TIMESTAMP ||
+        nt->OptionalHeader.SizeOfImage != DLC_SIZEOFIMAGE) {
+        logf_("SharpText: HitmanDlc.dlc build mismatch (stamp %08lx) — skipped",
+              (unsigned long)nt->FileHeader.TimeDateStamp);
+        return -1;
+    }
+    uint8_t *site = base + TTF_SIZE_RVA;
+    if (memcmp(site, TTF_SIZE_BYTES, 6) != 0) {
+        logf_("SharpText: unexpected bytes at patch site — skipped");
+        return -1;
+    }
+
+    g_invscale = 1.0 / (double)g_scale;
+    int32_t s4096 = (int32_t)lroundf(g_scale * 4096.0f);
+
+    uint8_t *stub = (uint8_t *)VirtualAlloc(NULL, 128,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!stub) return -1;
+    uint8_t *p = stub;
+    /* mov ecx,[esi+0x26c] */
+    memcpy(p, TTF_SIZE_BYTES, 6); p += 6;
+    /* imul ecx,ecx,imm32 */
+    *p++ = 0x69; *p++ = 0xC9; memcpy(p, &s4096, 4); p += 4;
+    /* add ecx,0x800 */
+    *p++ = 0x81; *p++ = 0xC1; *(uint32_t *)p = 0x800; p += 4;
+    /* sar ecx,12 */
+    *p++ = 0xC1; *p++ = 0xF9; *p++ = 0x0C;
+    /* jmp back to site+6 */
+    *p++ = 0xE9;
+    *(int32_t *)p = (int32_t)((site + 6) - (p + 4)); p += 4;
+
+    DWORD old;
+    if (!VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &old)) return -1;
+    site[0] = 0xE9;
+    *(int32_t *)(site + 1) = (int32_t)(stub - (site + 5));
+    site[5] = 0x90;
+    VirtualProtect(site, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, 6);
+
+    /* Labels (ZCHAROBJ/ZLINEOBJ/...) each carry their own render-scale
+     * doubles at +0xd7/+0xdf and the shared glyph-geometry builder
+     * (BUILDER_RVA) multiplies them into every glyph vertex. Compensation
+     * must apply only when the label's font (ptr at +0x10b) is a ZTTFONT.
+     * We hook the builder entry to compute the effective scale pair into
+     * globals (label scale, times 1/Scale for TTF fonts) and retarget the
+     * 16 `fmul qword [ebx+0xd7/0xdf]` sites in the builder to read the
+     * globals instead (same 6-byte encoding). Single render thread. */
+    {
+        static const uint8_t prolog[6] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8};
+        uint8_t *bsite = base + BUILDER_RVA;
+        if (memcmp(bsite, prolog, 6) != 0) {
+            logf_("SharpText: builder prologue mismatch — label scale fix skipped");
+        } else {
+            int nx = 0, ny = 0, bad = 0;
+            /* rewrite fmul sites first (they only take effect once the
+             * entry hook fills the globals every call) */
+            for (uint32_t rva = BUILDER_RVA; rva < BUILDER_RVA + 0xd00; rva++) {
+                uint8_t *q = base + rva;
+                if (q[0] != 0xDC || q[1] != 0x8B) continue;
+                uint32_t disp;
+                memcpy(&disp, q + 2, 4);
+                if (disp != ZFONT_SCALEX_OFF && disp != ZFONT_SCALEY_OFF) continue;
+                double *tgt = disp == ZFONT_SCALEX_OFF ? &g_eff_sx : &g_eff_sy;
+                DWORD o2;
+                if (!VirtualProtect(q, 6, PAGE_EXECUTE_READWRITE, &o2)) { bad++; continue; }
+                q[1] = 0x0D;   /* fmul qword [abs32] */
+                uint32_t a = (uint32_t)(uintptr_t)tgt;
+                memcpy(q + 2, &a, 4);
+                VirtualProtect(q, 6, o2, &o2);
+                if (disp == ZFONT_SCALEX_OFF) nx++; else ny++;
+            }
+            g_zttfont_vtbl = (uint32_t)(uintptr_t)(base + ZTTFONT_VTBL_RVA);
+            /* entry thunk: pushfd/pushad/push esp/call C/add esp,4/popad/
+             * popfd/<prolog>/jmp builder+6 */
+            uint8_t *t = stub + 64;
+            uint8_t *q = t;
+            *q++ = 0x9C; *q++ = 0x60; *q++ = 0x54;
+            *q++ = 0xE8; *(int32_t *)q = (int32_t)((uint8_t *)(uintptr_t)builder_entry
+                                                   - (q + 4)); q += 4;
+            *q++ = 0x83; *q++ = 0xC4; *q++ = 0x04;
+            *q++ = 0x61; *q++ = 0x9D;
+            memcpy(q, prolog, 6); q += 6;
+            *q++ = 0xE9; *(int32_t *)q = (int32_t)((bsite + 6) - (q + 4)); q += 4;
+            DWORD o3;
+            if (VirtualProtect(bsite, 6, PAGE_EXECUTE_READWRITE, &o3)) {
+                bsite[0] = 0xE9;
+                *(int32_t *)(bsite + 1) = (int32_t)(t - (bsite + 5));
+                bsite[5] = 0x90;
+                VirtualProtect(bsite, 6, o3, &o3);
+                FlushInstructionCache(GetCurrentProcess(), bsite, 6);
+                logf_("SharpText: label scale fix active (%d+%d fmul sites%s)",
+                      nx, ny, bad ? ", some skipped!" : "");
+            }
+        }
+    }
+
+    FlushInstructionCache(GetCurrentProcess(), stub, 128);
+    logf_("SharpText: TTF fonts rasterize at %.3fx size (render scale %.4f)",
+          (double)g_scale, g_invscale);
+    return 1;
+}
+
 static DWORD WINAPI watch_thread(LPVOID arg)
 {
     (void)arg;
     int applied = 0;
+    int sharp_done = 0;
     int32_t vw = 0, vh = 0;         /* virtual size we maintain */
     int32_t realw = 0, realh = 0;   /* last seen real mode */
     for (;;) {
         Sleep(applied ? 250 : 50);
+        if (g_sharptext && !sharp_done && patch_sharptext() != 0)
+            sharp_done = 1;
         uint8_t *si = sysiface();
         if (!si) continue;
         int32_t curw, curh, w, h;
