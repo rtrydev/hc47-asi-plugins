@@ -19,6 +19,13 @@ rtrace: ../dist/HC47RenderTrace.asi
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# diagnostic EIP-sampling profiler (not part of `all`)
+prof: ../dist/HC47Profile.asi
+
+../dist/HC47Profile.asi: eipprof.c
+	@mkdir -p ../dist
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 ../dist/HC47ReducedX87.asi: hc47x87.c helpers.S
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
