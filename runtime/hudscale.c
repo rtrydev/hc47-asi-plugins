@@ -21,9 +21,21 @@
  *   Scale=2.0        ; 1.0 = off; fractional values fine (e.g. 1.5)
  *   SharpText=1      ; re-rasterize TTF fonts at the real pixel size
  *
+ * Timing matters: the renderer copies the requested resolution into the
+ * current-mode fields (+0x21/+0x25) already at window creation, several
+ * hundred ms BEFORE it runs display-mode selection, which reads +0x19/
+ * +0x1d back. Writing the virtual size in that window makes fullscreen
+ * mode selection pick a real mode of the virtual size (e.g. a 1920x1080
+ * mode on a 4K display) and the GUI ends up unscaled. So the first apply
+ * happens from an ntdll loader notification when HitmanDlc.dlc loads:
+ * by then the renderer is fully initialized (real mode set, device
+ * created), and none of the GUI layout code (which lives in that DLL)
+ * can have run yet.
+ *
  * A watchdog re-applies the virtual size if the game rewrites the fields
  * (mode change from the options menu re-runs apply-settings, which copies
- * the current mode back over them).
+ * the current mode back over them); it is gated on HitmanDlc.dlc being
+ * loaded for the same reason.
  *
  * SharpText: menu/HUD text comes from TrueType fonts rasterized at load
  * time by a FreeType build embedded in HitmanDlc.dlc (class ZTTFONT).
@@ -266,46 +278,73 @@ static int patch_sharptext(void)
     return 1;
 }
 
+static CRITICAL_SECTION g_applylock;
+static int g_applied;
+static int32_t g_vw, g_vh;          /* virtual size we maintain */
+static int32_t g_realw, g_realh;    /* last seen real mode */
+
+/* Apply (or re-apply) the virtual size. Only safe once HitmanDlc.dlc is
+ * loaded: before that the current-mode fields merely mirror the request
+ * (mode selection has not run) and shrinking the request would make the
+ * game set a real mode of the virtual size. */
+static void try_apply(void)
+{
+    if (!GetModuleHandleA("HitmanDlc.dlc")) return;
+    uint8_t *si = sysiface();
+    if (!si) return;
+    EnterCriticalSection(&g_applylock);
+    int32_t curw, curh, w, h;
+    memcpy(&curw, si + SI_CURW, 4);
+    memcpy(&curh, si + SI_CURH, 4);
+    memcpy(&w, si + SI_WIDTH, 4);
+    memcpy(&h, si + SI_HEIGHT, 4);
+    if (curw < 320 || curh < 200 || curw > 16384 || curh > 16384) {
+        LeaveCriticalSection(&g_applylock);
+        return;                     /* mode not established yet */
+    }
+    if (curw != g_realw || curh != g_realh) {
+        /* first mode-set, or the mode changed */
+        g_realw = curw; g_realh = curh;
+        g_vw = (int32_t)lroundf((float)g_realw / g_scale);
+        g_vh = (int32_t)lroundf((float)g_realh / g_scale);
+        logf_("mode %dx%d -> virtual GUI %dx%d (scale %.3f)",
+              g_realw, g_realh, g_vw, g_vh, (double)g_scale);
+        g_applied = 0;
+    }
+    if (w != g_vw || h != g_vh) {
+        memcpy(si + SI_WIDTH, &g_vw, 4);
+        memcpy(si + SI_HEIGHT, &g_vh, 4);
+        if (!g_applied)
+            logf_("applied virtual GUI size %dx%d (was %dx%d)",
+                  g_vw, g_vh, w, h);
+        else
+            logf_("re-applied virtual GUI size (game wrote %dx%d)", w, h);
+        g_applied = 1;
+    }
+    LeaveCriticalSection(&g_applylock);
+}
+
+/* ntdll loader notification: fires on HitmanDlc.dlc load before any of
+ * its code runs — the deterministic first-apply point. */
+typedef VOID (CALLBACK *LDR_NOTIFY_FN)(ULONG reason, const void *data, void *ctx);
+typedef LONG (NTAPI *LdrRegisterDllNotification_t)(ULONG, LDR_NOTIFY_FN, void *, void **);
+
+static VOID CALLBACK on_dll_notify(ULONG reason, const void *data, void *ctx)
+{
+    (void)data; (void)ctx;
+    if (reason == 1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */)
+        try_apply();
+}
+
 static DWORD WINAPI watch_thread(LPVOID arg)
 {
     (void)arg;
-    int applied = 0;
     int sharp_done = 0;
-    int32_t vw = 0, vh = 0;         /* virtual size we maintain */
-    int32_t realw = 0, realh = 0;   /* last seen real mode */
     for (;;) {
-        Sleep(applied ? 250 : 50);
+        Sleep(g_applied ? 250 : 50);
         if (g_sharptext && !sharp_done && patch_sharptext() != 0)
             sharp_done = 1;
-        uint8_t *si = sysiface();
-        if (!si) continue;
-        int32_t curw, curh, w, h;
-        memcpy(&curw, si + SI_CURW, 4);
-        memcpy(&curh, si + SI_CURH, 4);
-        memcpy(&w, si + SI_WIDTH, 4);
-        memcpy(&h, si + SI_HEIGHT, 4);
-        if (curw < 320 || curh < 200 || curw > 16384 || curh > 16384)
-            continue;               /* mode not established yet */
-
-        if (curw != realw || curh != realh) {
-            /* first mode-set, or the mode changed */
-            realw = curw; realh = curh;
-            vw = (int32_t)lroundf((float)realw / g_scale);
-            vh = (int32_t)lroundf((float)realh / g_scale);
-            logf_("mode %dx%d -> virtual GUI %dx%d (scale %.3f)",
-                  realw, realh, vw, vh, (double)g_scale);
-            applied = 0;
-        }
-        if (w != vw || h != vh) {
-            memcpy(si + SI_WIDTH, &vw, 4);
-            memcpy(si + SI_HEIGHT, &vh, 4);
-            if (!applied)
-                logf_("applied virtual GUI size %dx%d (was %dx%d)",
-                      vw, vh, w, h);
-            else
-                logf_("re-applied virtual GUI size (game wrote %dx%d)", w, h);
-            applied = 1;
-        }
+        try_apply();
     }
     return 0;
 }
@@ -324,8 +363,16 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         g_scale = read_scale();
         logf_("HC47 HUD Scale loaded, Scale=%.3f%s", (double)g_scale,
               g_scale == 1.0f ? " (disabled)" : "");
-        if (g_scale != 1.0f)
+        if (g_scale != 1.0f) {
+            InitializeCriticalSection(&g_applylock);
+            LdrRegisterDllNotification_t reg = (LdrRegisterDllNotification_t)
+                (uintptr_t)GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                          "LdrRegisterDllNotification");
+            void *cookie = NULL;
+            if (reg && reg(0, on_dll_notify, NULL, &cookie) == 0)
+                logf_("using loader notifications for first apply");
             CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
+        }
     }
     return TRUE;
 }
