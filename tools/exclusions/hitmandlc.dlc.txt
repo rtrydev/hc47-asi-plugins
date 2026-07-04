@@ -92,3 +92,14 @@
 1cb580
 1cc6e0
 1cc6f0
+# 2026-07-04: camera-setup functions containing HC47Widescreen patch sites
+# (67.4-deg FOV push immediates + sniper scope FOV loads). Translation would
+# copy the original constants into the SSE2 blob and bypass the in-place
+# FOV patches. Cold setup code; negligible perf impact.
+26860
+211f0
+23e00
+28290
+2c140
+2fd20
+2e460
