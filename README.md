@@ -22,6 +22,8 @@ patch path rather than blindly patching unknown code.
 
 ## Build & Install
 
+### mac
+
 ```sh
 brew install mingw-w64
 pip3 install capstone pefile
@@ -32,17 +34,63 @@ python3 tools/translate.py HitmanDlc.dlc   # writes dist/HitmanDlc.dlc.x87
 ./install.sh -u                             # uninstall generated plugin files
 ```
 
+### Windows
+
+The same sources build natively with MSYS2's 32-bit mingw-w64 gcc; the
+Makefile picks the right compiler by platform, and the generated `.x87`
+patch files are byte-identical to the mac-built ones.
+
+```powershell
+winget install MSYS2.MSYS2
+C:\msys64\usr\bin\pacman.exe -S --noconfirm mingw-w64-i686-gcc make
+pip install capstone pefile
+
+.\build.ps1 -Translate -Install    # build + regenerate .x87 + install
+```
+
+`build.ps1` wraps the same `make` / `translate.py` / `install.sh` steps
+with the MSYS2 toolchain on PATH; `install.sh` also runs fine from Git
+Bash directly.
+
 The build includes its own ASI loader (`dist/dsound.dll`, installed into
 the game root), so no third-party loader is needed — see the ASI Loader
 section below.
 
-By default `install.sh` targets:
+By default `install.sh` targets the platform's default Steam install:
 
 ```text
-/Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47
+mac:     /Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47
+Windows: C:\Program Files (x86)\Steam\steamapps\common\Hitman Codename 47
 ```
 
-Override it with `HC47_GAME_DIR=/path/to/game ./install.sh`.
+Override it with `HC47_GAME_DIR=/path/to/game ./install.sh` (the same
+variable is honored by `tools/analyze.py` / `tools/translate.py`).
+
+## Renderer and window-mode support
+
+The renderer is chosen by the `DrawDll` line in `Hitman.ini`; what works
+depends on the platform:
+
+| | RenderD3D | RenderOpenGL |
+|---|---|---|
+| mac / CrossOver | any resolution, fullscreen + windowed | untested |
+| Windows | max 2048px per axis (auto-clamped) | any resolution, fullscreen + windowed |
+
+On modern Windows the legacy Direct3D 7 HAL (emulated by `ddraw.dll`)
+refuses render targets larger than 2048px per axis, in windowed and
+fullscreen mode alike — the stock game dies with "Unable to initialize
+Direct3D". The Widescreen plugin detects this (real Windows only, never
+under Wine) and clamps the requested resolution to the best fitting
+display mode (fullscreen) or window size (windowed) so the game always
+starts; for native 4K on Windows switch `DrawDll` to `RenderOpenGL.dll`.
+
+Fullscreen additionally requires the exact `hitman.ini` resolution to
+exist in the driver's display-mode list; a miss makes the stock game die
+with "Unable to find a suitable display mode for true color. Try
+changing to 16bit colors." (common under CrossOver, whose mode list
+rarely contains the exact requested resolution). The Widescreen plugin
+validates the resolution against the mode list before the renderer
+starts and falls back to the closest available mode.
 
 ## Plugin: Reduced x87 (`HC47ReducedX87.asi`)
 
@@ -125,6 +173,17 @@ real display mode. `HC47HudScale.asi` waits for display setup, then keeps
 renderer stretches it back to the real viewport. The 3D scene and actual
 display mode are not changed.
 
+The first apply is timing-critical: the renderer mirrors the requested
+resolution into the current-mode fields already at window creation,
+hundreds of ms before display-mode selection reads the requested fields
+back. Writing the virtual size in that window makes fullscreen mode
+selection pick a real display mode of the *virtual* size, silently
+downgrading a 4K request to 1080p with an unscaled GUI. The plugin
+therefore applies from an ntdll loader notification when `HitmanDlc.dlc`
+loads — after renderer init is fully done, before any GUI layout code
+(which lives in that DLL) can run — and gates its re-apply watchdog on
+the same condition.
+
 `SharpText=1` additionally patches the TrueType font path so text is
 rasterized at the real pixel size instead of being magnified from the smaller
 virtual layout.
@@ -144,7 +203,9 @@ Install output:
 - Log: `scripts/HC47HudScale.log`
 
 Diagnostic tooling used while reverse-engineering the GUI pipeline lives in
-`runtime/rtrace.c` and can be built with `make rtrace` from `runtime/`.
+`runtime/rtrace.c` and can be built with `make rtrace` from `runtime/`;
+`runtime/wmdiag.c` (`make wmdiag`) plants one-shot breakpoint probes on the
+RenderD3D display-init path and logs which step fails with what HRESULT.
 
 ## Plugin: HUD Extras (`HC47HudExtras.asi`)
 
@@ -194,8 +255,17 @@ Three patch groups:
   fullscreen. The plugin flips the guarding `je` to an unconditional jump
   in whichever renderer is loaded (`RenderD3D.dll` / `RenderOpenGL.dll`),
   so any `Resolution WxH` from hitman.ini passes through unmodified.
-  Nothing is written into `ZSysInterface`, so there is no ini to keep in
-  sync and no interaction with `HC47HudScale`.
+  (The stock ladder is also broken for widths it does not know: it loads
+  an uninitialized height and the game dies with the "16bit colors"
+  mode error, so the passthrough fixes stock fullscreen at non-ladder
+  resolutions too.)
+- **Resolution guard** — before the renderer runs mode selection, the
+  requested resolution is validated: in fullscreen it must exist in the
+  `EnumDisplaySettings` mode list, and with `RenderD3D` on real Windows
+  both axes must fit the emulated D3D7 HAL's 2048px render-target limit.
+  A failing request is clamped to the best working resolution (see
+  "Renderer and window-mode support" above) instead of letting the game
+  die with a fatal display-mode error.
 - **FOV correction** — the real display mode is read from `ZSysInterface`
   (the current-mode fields `HC47HudScale` leaves real) and every FOV
   source gets the standard Vert- to Hor+ correction

@@ -1,7 +1,14 @@
 #!/bin/bash
-# Install (or uninstall with -u) HC47 Reduced-Precision x87 into the game.
+# Install (or uninstall with -u) the HC47 plugins into the game.
+# Works on mac (CrossOver bottle) and on Windows under Git Bash / MSYS2.
 set -e
-GAME="${HC47_GAME_DIR:-/Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47}"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        DEFAULT_GAME="/c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47";;
+    *)
+        DEFAULT_GAME="/Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47";;
+esac
+GAME="${HC47_GAME_DIR:-$DEFAULT_GAME}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 if [ "$1" = "-u" ]; then

@@ -7,8 +7,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hc47x87.module import Module
 from hc47x87 import analysis, x87
 
-GAME = ("/Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/"
-        "drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47")
+# Default game location: HC47_GAME_DIR env, else the platform's default
+# Steam install (CrossOver bottle on mac, Program Files on Windows).
+GAME = os.environ.get("HC47_GAME_DIR") or (
+    "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Hitman Codename 47"
+    if os.name == "nt" else
+    "/Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/"
+    "drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47")
 
 
 def census(mod):
