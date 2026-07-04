@@ -57,7 +57,7 @@ fi
 if [ -f "$HERE/dist/HC47Widescreen.asi" ]; then
     cp "$HERE/dist/HC47Widescreen.asi" "$GAME/scripts/"
     if [ ! -f "$GAME/scripts/HC47Widescreen.ini" ]; then
-        printf '[Widescreen]\nEnabled=1\nFOVFactor=1.0\nDrawDistanceFactor=1.0\n' > "$GAME/scripts/HC47Widescreen.ini"
+        printf '[Widescreen]\nEnabled=1\nFOVFactor=1.0\nDrawDistanceFactor=1.0\nBorderless=-1\n' > "$GAME/scripts/HC47Widescreen.ini"
     fi
 fi
 

@@ -50,6 +50,27 @@
  * (not Wine) the size must pass a Direct3D7 render-target probe; when a
  * check fails the request is clamped to the best resolution that works.
  *
+ * Borderless fullscreen (default on Wine/CrossOver): exclusive DirectDraw
+ * fullscreen is broken under the CrossOver Mac driver — the emulated mode
+ * change renders oversized on scaled Retina desktops, exclusive-mode
+ * cursor clipping freezes the mouse, and alt-tab loses the exclusive
+ * surfaces (permanent black window; the game never restores them). The
+ * windowed path has none of these problems, so when hitman.ini asks for
+ * fullscreen the request is converted before the renderer loads: the
+ * ZSysInterface fullscreen flag (+0x12) is cleared and the resolution is
+ * replaced with the current desktop size. The game's own windowed path
+ * already creates an undecorated popup window, so this alone yields
+ * borderless fullscreen; the window is only nudged so its client area
+ * sits at 0,0 (its style is never touched — restyling a live DirectDraw
+ * device window blacks out rendering under the CrossOver Mac driver).
+ * The same conversion is installed as a hook on the renderer's mode-set
+ * path (replacing the plain snap-skip jump), so toggling fullscreen in
+ * the in-game options converts on the fly instead of breaking, and the
+ * desktop resolution is added to the options screen's resolution list
+ * (the list, its "%d x %d" labels and the applied values all come from
+ * the renderer's static mode table; a copy with one extra entry replaces
+ * it via the table accessor's imm32).
+ *
  * A watchdog thread applies the renderer patch as soon as the renderer
  * module appears, applies the HitmanDlc patches once the display mode is
  * known, and rewrites the FOV constants if the mode changes at run time.
@@ -59,6 +80,9 @@
  *   Enabled=1
  *   FOVFactor=1.0          ; extra factor on the gameplay camera FOV
  *   DrawDistanceFactor=1.0 ; 1.0 leaves the draw distance untouched
+ *   Borderless=-1          ; fullscreen -> borderless window at desktop
+ *                          ; resolution: -1 auto (on under Wine, off on
+ *                          ; real Windows), 0 never, 1 always
  */
 #include <windows.h>
 #include <stdio.h>
@@ -85,10 +109,15 @@
 #define SCOPE1_RVA       0x2e544   /* fld dword [esi+eax*4+0xd8] */
 #define SCOPE2_RVA       0x2e633
 #define DRAWDIST_RVA     0x24ec2   /* mov eax,[ebp+0x18a] (far clip) */
+#define RESSEL_RVA       0x6acfb   /* mov edx,[esi+0x11f] — options-screen
+                                      init loads the config width here and
+                                      matches it against the mode table to
+                                      pick the selected resolution entry */
 static const uint8_t CUT_BYTES[6]   = { 0xdd, 0x44, 0x24, 0x14, 0xdc, 0x0d };
 #define CUT_SITE_LEN 10
 static const uint8_t SCOPE_BYTES[7] = { 0xd9, 0x84, 0x86, 0xd8, 0x00, 0x00, 0x00 };
 static const uint8_t DD_BYTES[6]    = { 0x8b, 0x85, 0x8a, 0x01, 0x00, 0x00 };
+static const uint8_t RESSEL_BYTES[6] = { 0x8b, 0x96, 0x1f, 0x01, 0x00, 0x00 };
 
 /* `push 0x4050d999; push 0x9999999a` — the double 67.4 handed to SetFOV.
  * Index 0 is the gameplay (mouse-controlled) camera; the rest are base /
@@ -101,17 +130,28 @@ static const uint8_t PUSH_BYTES[10] = { 0x68, 0x99, 0xd9, 0x50, 0x40,
 #define ORIG_FOV_DEG 67.4
 
 /* Resolution-snap guard in the renderers: identical 16-byte sequence
- * `je +0x105; mov eax,[edx+0x19]; cmp eax,0x200; jge` in both. */
+ * `je +0x105; mov eax,[edx+0x19]; cmp eax,0x200; jge` in both. The `je`
+ * skips the 4:3 snap ladder; its target is site+0x10b.
+ *
+ * mode_table/mode_getter: the renderer's static display-mode table
+ * ({w,h,bpp,0} entries, 16 bytes each, null-terminated) that backs the
+ * in-game options resolution list, and the one-instruction accessor
+ * `mov eax, imm32; ret` the game reaches it through (menu labels are
+ * formatted "%d x %d" from the entries, and applying a selection copies
+ * the entry's w/h into the config, so extending the table is all it
+ * takes to add a resolution to the menu). */
 static const uint8_t SNAP_BYTES[16] = {
     0x0f, 0x84, 0x05, 0x01, 0x00, 0x00, 0x8b, 0x42, 0x19,
     0x3d, 0x00, 0x02, 0x00, 0x00, 0x7d, 0x0f
 };
+#define SNAP_SKIP 0x10b   /* je target, relative to the snap site */
 static const struct renderer_site {
     const char *module;
     uint32_t timestamp, sizeofimage, rva;
+    uint32_t mode_getter, mode_table;
 } RENDERERS[2] = {
-    { "RenderD3D.dll",    0x3a3e1338, 0x4d000, 0x29363 },
-    { "RenderOpenGL.dll", 0x3a3e1318, 0x56000, 0x2b913 },
+    { "RenderD3D.dll",    0x3a3e1338, 0x4d000, 0x29363, 0x298c0, 0x3d178 },
+    { "RenderOpenGL.dll", 0x3a3e1318, 0x56000, 0x2b913, 0x2be70, 0x36d28 },
 };
 
 static FILE *g_log;
@@ -119,6 +159,8 @@ static char g_dir[MAX_PATH];
 static int g_enabled = 1;
 static float g_fovfactor = 1.0f;
 static float g_ddfactor = 1.0f;
+static int g_borderless = -1;        /* -1 auto (Wine), 0 never, 1 always */
+static int g_borderless_active;      /* fullscreen request was converted */
 
 static double g_fov_scale = 1.0;   /* aspect / (4/3), read by hook callbacks */
 static double g_cut_out;           /* cutscene FOV, radians, set per call */
@@ -155,6 +197,9 @@ static void read_config(void)
         else if (sscanf(line, " DrawDistanceFactor = %f", &v) == 1 ||
                  sscanf(line, " DrawDistanceFactor=%f", &v) == 1)
             g_ddfactor = v;
+        else if (sscanf(line, " Borderless = %d", &b) == 1 ||
+                 sscanf(line, " Borderless=%d", &b) == 1)
+            g_borderless = b < 0 ? -1 : b != 0;
     }
     fclose(f);
     if (!(g_fovfactor >= 0.5f && g_fovfactor <= 2.0f)) g_fovfactor = 1.0f;
@@ -168,6 +213,44 @@ static uint8_t *sysiface(void)
     uint8_t **pp = (uint8_t **)(uintptr_t)GetProcAddress(g,
         "?g_pSysInterface@@3PAVZSysInterface@@A");
     return (pp && *pp) ? *pp : NULL;
+}
+
+static int is_wine(void)
+{
+    return GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                          "wine_get_version") != NULL;
+}
+
+static int borderless_wanted(void)
+{
+    return g_borderless == 1 || (g_borderless == -1 && is_wine());
+}
+
+static int desktop_size(int32_t *w, int32_t *h)
+{
+    *w = GetSystemMetrics(SM_CXSCREEN);
+    *h = GetSystemMetrics(SM_CYSCREEN);
+    return *w >= 320 && *h >= 200;
+}
+
+/* Turn a pending fullscreen request in ZSysInterface into a windowed
+ * request at the desktop resolution. Called from the startup guard, from
+ * the renderer (re)init hook (in-game options apply), and from the
+ * watchdog as a backstop. */
+static int convert_to_borderless(uint8_t *si, const char *when)
+{
+    int32_t dw, dh, w, h;
+    if (!si[0x12] || !borderless_wanted() || !desktop_size(&dw, &dh))
+        return 0;
+    memcpy(&w, si + 0x19, 4);
+    memcpy(&h, si + 0x1d, 4);
+    si[0x12] = 0;
+    memcpy(si + 0x19, &dw, 4);
+    memcpy(si + 0x1d, &dh, 4);
+    g_borderless_active = 1;
+    logf_("borderless: fullscreen %dx%d -> windowed %dx%d "
+          "(desktop resolution, %s)", w, h, dw, dh, when);
+    return 1;
 }
 
 /* Vert- -> Hor+ FOV correction */
@@ -206,9 +289,54 @@ void __cdecl drawdist_entry(uint32_t *regs)
     memcpy(&g_dd_out, &v, 4);
 }
 
+/* Options-screen init: the game restores the resolution selection (and
+ * the values a no-change apply writes back) from its saved profile, not
+ * from the mode actually running — a hand-edited hitman.ini shows up as
+ * the 800x600 default. Replace the config w/h with the real current mode
+ * from ZSysInterface and hand the matcher that width (it goes into EDX,
+ * which the replaced instruction loaded the config width into). */
+void __cdecl reslist_entry(uint32_t *regs)
+{
+    uint8_t *obj = (uint8_t *)(uintptr_t)regs[1];    /* esi */
+    int32_t w = 0, h = 0;
+    uint8_t *si = sysiface();
+    if (si) {
+        memcpy(&w, si + SI_CURW, 4);
+        memcpy(&h, si + SI_CURH, 4);
+    }
+    if (w >= 320 && h >= 200 && w <= 16384 && h <= 16384) {
+        memcpy(obj + 0x11f, &w, 4);
+        memcpy(obj + 0x123, &h, 4);
+    } else {
+        memcpy(&w, obj + 0x11f, 4);                  /* fall back */
+    }
+    regs[5] = (uint32_t)w;                           /* edx */
+}
+
+/* Runs at the renderer's window-create/mode-set path on every (re)init —
+ * including the in-game options apply, which re-requests fullscreen when
+ * the player toggles it in the menu. */
+void __cdecl reinit_entry(uint32_t *regs)
+{
+    (void)regs;
+    uint8_t *si = sysiface();
+    if (si)
+        convert_to_borderless(si, "renderer re-init");
+}
+
 /* stub emission */
 static uint8_t *g_stubs;
 static uint8_t *g_stub_p;
+
+static int ensure_stubs(void)
+{
+    if (!g_stubs) {
+        g_stubs = (uint8_t *)VirtualAlloc(NULL, 4096,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        g_stub_p = g_stubs;
+    }
+    return g_stubs != NULL;
+}
 
 static uint8_t *emit_hook_call(uint8_t *p, void *fn)
 {
@@ -258,9 +386,51 @@ static int module_matches(HMODULE m, uint32_t stamp, uint32_t size)
            nt->OptionalHeader.SizeOfImage == size;
 }
 
-/* Make the resolution-snap `je` unconditional in whichever renderer is
- * loaded. Returns 1 patched, -1 mismatch (give up), 0 not loaded yet.
- * On success *which is set to the RENDERERS index (0 = RenderD3D). */
+/* Extend the renderer's static display-mode table (the source of the
+ * in-game options resolution list) with the desktop resolution: build a
+ * copy with one extra entry and repoint the accessor's imm32 at it. The
+ * options screen then lists the desktop resolution, and because the
+ * startup conversion put the desktop size into the config, it also opens
+ * with that entry selected. */
+static void inject_menu_mode(const struct renderer_site *r, uint8_t *base)
+{
+    int32_t dw, dh;
+    if (!borderless_wanted() || !desktop_size(&dw, &dh))
+        return;
+    uint8_t *getter = base + r->mode_getter;
+    int32_t *tab = (int32_t *)(base + r->mode_table);
+    uint32_t expect = (uint32_t)(uintptr_t)tab;
+    if (getter[0] != 0xb8 || getter[5] != 0xc3 ||
+        memcmp(getter + 1, &expect, 4) != 0) {
+        logf_("%s: unexpected mode-table accessor — menu entry not added",
+              r->module);
+        return;
+    }
+    int n = 0;
+    while (n < 32 && tab[n * 4]) {
+        if (tab[n * 4] == dw && tab[n * 4 + 1] == dh)
+            return;                       /* already in the list */
+        n++;
+    }
+    int32_t *nt = (int32_t *)VirtualAlloc(NULL, (size_t)(n + 2) * 16,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!nt) return;
+    memcpy(nt, tab, (size_t)n * 16);
+    nt[n * 4] = dw;
+    nt[n * 4 + 1] = dh;
+    nt[n * 4 + 2] = 32;                   /* terminator stays zeroed */
+    uint32_t nv = (uint32_t)(uintptr_t)nt;
+    if (write_code(getter + 1, (uint8_t *)&nv, 4))
+        logf_("%s: %dx%d added to the options resolution list",
+              r->module, dw, dh);
+}
+
+/* Disable the resolution-snap ladder in whichever renderer is loaded and
+ * put the (re)init hook in its place, so an in-game fullscreen request
+ * is converted to borderless before mode selection runs. Also extends
+ * the options menu with the desktop resolution. Returns 1 patched, -1
+ * mismatch (give up), 0 not loaded yet. On success *which is set to the
+ * RENDERERS index (0 = RenderD3D). */
 static int patch_renderer_snap(int *which)
 {
     for (int i = 0; i < 2; i++) {
@@ -277,11 +447,17 @@ static int patch_renderer_snap(int *which)
                   RENDERERS[i].module);
             return -1;
         }
-        /* je rel32 -> jmp rel32 (one byte shorter) + nop */
-        static const uint8_t jmp6[6] = { 0xe9, 0x06, 0x01, 0x00, 0x00, 0x90 };
-        if (!write_code(site, jmp6, 6)) return -1;
+        /* je rel32 -> jmp to a stub that converts a fullscreen request,
+         * then continues at the je target (skipping the snap ladder) */
+        if (!ensure_stubs()) return -1;
+        uint8_t *stub = g_stub_p;
+        uint8_t *p = emit_hook_call(stub, (void *)reinit_entry);
+        p = emit_jmp(p, site + SNAP_SKIP);
+        g_stub_p = p;
+        if (!hook_site(site, 6, stub)) return -1;
         logf_("%s: resolution snap disabled — hitman.ini resolution passes through",
               RENDERERS[i].module);
+        inject_menu_mode(&RENDERERS[i], (uint8_t *)m);
         *which = i;
         return 1;
     }
@@ -289,12 +465,6 @@ static int patch_renderer_snap(int *which)
 }
 
 /* ---- resolution guard ------------------------------------------------ */
-
-static int is_wine(void)
-{
-    return GetProcAddress(GetModuleHandleA("ntdll.dll"),
-                          "wine_get_version") != NULL;
-}
 
 /* Maximum render-target axis for the legacy Direct3D7 HAL that modern
  * Windows emulates: CreateDevice fails with D3DERR_INVALID_DEVICE above
@@ -338,6 +508,16 @@ static int guard_resolution(uint8_t *si)
     memcpy(&h, si + 0x1d, 4);
     if (w < 320 || h < 200 || w > 16384 || h > 16384)
         return 0;                         /* ini not parsed yet — retry */
+
+    /* fullscreen -> borderless window at the desktop resolution (see the
+     * header comment; default on Wine, where exclusive DirectDraw
+     * fullscreen is broken under the CrossOver Mac driver) */
+    if (fullscreen && convert_to_borderless(si, "startup")) {
+        fullscreen = 0;
+        memcpy(&w, si + 0x19, 4);
+        memcpy(&h, si + 0x1d, 4);
+    }
+
     int32_t limit = drawdll_is_d3d() && !is_wine() ? D3D7_MAX_RT_AXIS
                                                    : 0x7fffffff;
 
@@ -395,6 +575,87 @@ static int guard_resolution(uint8_t *si)
     return 1;
 }
 
+/* Strip the game window to a borderless popup covering the desktop.
+ * Runs once the renderer has established the display mode (so the window
+ * exists); retried by the watchdog until a window is found. The game
+ * window is the process's visible top-level window whose client area
+ * matches the display mode (fallback: the largest one); every candidate
+ * is logged for diagnosis. */
+struct wnd_pick {
+    HWND best;
+    int best_exact;
+    int32_t best_area;
+    int32_t w, h;                         /* current display mode */
+};
+
+static BOOL CALLBACK find_game_window(HWND hwnd, LPARAM lp)
+{
+    struct wnd_pick *pick = (struct wnd_pick *)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId())
+        return TRUE;
+    char cls[64] = "", title[64] = "";
+    GetClassNameA(hwnd, cls, sizeof(cls));
+    GetWindowTextA(hwnd, title, sizeof(title));
+    RECT r = {0,0,0,0}, c = {0,0,0,0};
+    GetWindowRect(hwnd, &r);
+    GetClientRect(hwnd, &c);
+    int vis = IsWindowVisible(hwnd);
+    logf_("  wnd class='%s' title='%s' outer %ldx%ld at %ld,%ld "
+          "client %ldx%ld style %08lx/%08lx%s", cls, title,
+          (long)(r.right - r.left), (long)(r.bottom - r.top),
+          (long)r.left, (long)r.top,
+          (long)c.right, (long)c.bottom,
+          (unsigned long)GetWindowLongA(hwnd, GWL_STYLE),
+          (unsigned long)GetWindowLongA(hwnd, GWL_EXSTYLE),
+          vis ? "" : " (hidden)");
+    if (!vis || c.right < 320 || c.bottom < 200)
+        return TRUE;                      /* skip splash/helper windows */
+    int exact = c.right == pick->w && c.bottom == pick->h;
+    int32_t area = c.right * c.bottom;
+    if (exact > pick->best_exact ||
+        (exact == pick->best_exact && area > pick->best_area)) {
+        pick->best = hwnd;
+        pick->best_exact = exact;
+        pick->best_area = area;
+    }
+    return TRUE;
+}
+
+static int apply_borderless(int32_t w, int32_t h)
+{
+    struct wnd_pick pick = { NULL, 0, 0, w, h };
+    logf_("borderless: process windows:");
+    EnumWindows(find_game_window, (LPARAM)&pick);
+    if (!pick.best) return 0;
+
+    /* The game's windowed path already creates an undecorated popup
+     * (that is why hitman.ini has StartUpperPos: the window cannot be
+     * dragged) — with the resolution forced to the desktop size it IS a
+     * borderless-fullscreen window. Touching the style of a live
+     * DirectDraw device window breaks rendering under the CrossOver Mac
+     * driver (permanent black window), so intervene as little as
+     * possible: never restyle, and only move the window when the client
+     * area does not sit at 0,0. */
+    POINT origin = { 0, 0 };
+    ClientToScreen(pick.best, &origin);
+    RECT c;
+    GetClientRect(pick.best, &c);
+    if (origin.x == 0 && origin.y == 0) {
+        logf_("borderless: game window client %ldx%ld already at 0,0 — "
+              "left untouched", (long)c.right, (long)c.bottom);
+        return 1;
+    }
+    RECT r;
+    GetWindowRect(pick.best, &r);
+    SetWindowPos(pick.best, NULL, r.left - origin.x, r.top - origin.y,
+                 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    logf_("borderless: moved game window client (was at %ld,%ld) to 0,0",
+          (long)origin.x, (long)origin.y);
+    return 1;
+}
+
 static int g_push_ok;   /* push sites verified, safe to (re)write */
 
 /* Rewrite the 67.4-degree immediates for the current g_fov_scale. */
@@ -433,10 +694,7 @@ static int patch_dlc(uint8_t *base)
     }
     g_push_ok = 1;
 
-    g_stubs = (uint8_t *)VirtualAlloc(NULL, 4096,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!g_stubs) return -1;
-    g_stub_p = g_stubs;
+    if (!ensure_stubs()) return -1;
 
     /* cutscene: replace `fld qword [esp+0x14]; fmul deg2rad` with a hook
      * that computes the corrected value in radians, then fld it */
@@ -474,6 +732,20 @@ static int patch_dlc(uint8_t *base)
             logf_("scope FOV hook %d installed", i);
     }
 
+    /* options-screen resolution selection: replace the config-width load
+     * so the menu reflects (and re-applies) the actual current mode */
+    site = base + RESSEL_RVA;
+    if (memcmp(site, RESSEL_BYTES, sizeof(RESSEL_BYTES)) == 0) {
+        uint8_t *stub = g_stub_p;
+        uint8_t *p = emit_hook_call(stub, (void *)reslist_entry);
+        p = emit_jmp(p, site + sizeof(RESSEL_BYTES));
+        g_stub_p = p;
+        if (hook_site(site, sizeof(RESSEL_BYTES), stub))
+            logf_("options-screen resolution selection hook installed");
+    } else {
+        logf_("options-screen selection: unexpected bytes — skipped");
+    }
+
     /* draw distance: replace `mov eax,[ebp+0x18a]` only when scaling */
     if (g_ddfactor != 1.0f) {
         site = base + DRAWDIST_RVA;
@@ -501,6 +773,7 @@ static DWORD WINAPI watch_thread(LPVOID arg)
     int snap_tries = 0;
     int renderer = -1, guarded = 0;
     (void)renderer;
+    int borderless_done = 0;
     int32_t lastw = 0, lasth = 0;
     for (;;) {
         int settled = snap_state != 0 && dlc_state != 0;
@@ -513,6 +786,10 @@ static DWORD WINAPI watch_thread(LPVOID arg)
          * been loaded yet when the parsed ini resolution appears */
         if (si && !guarded)
             guarded = guard_resolution(si);
+        /* backstop: if something re-requested fullscreen through a path
+         * the renderer (re)init hook does not cover, convert it here */
+        if (si && guarded)
+            convert_to_borderless(si, "watchdog");
         if (snap_state == 0) {
             snap_state = patch_renderer_snap(&renderer);
             if (snap_state == 0 && ++snap_tries > 1600) {
@@ -526,9 +803,17 @@ static DWORD WINAPI watch_thread(LPVOID arg)
         memcpy(&h, si + SI_CURH, 4);
         if (w < 320 || h < 200 || w > 16384 || h > 16384)
             continue;               /* mode not established yet */
-        if (w == lastw && h == lasth)
+        int changed = w != lastw || h != lasth;
+        if (changed) {
+            lastw = w; lasth = h;
+            borderless_done = 0;
+        }
+        /* mode established -> the renderer window exists; retried until
+         * EnumWindows finds it, re-run when the mode changes */
+        if (g_borderless_active && !borderless_done)
+            borderless_done = apply_borderless(w, h);
+        if (!changed)
             continue;
-        lastw = w; lasth = h;
         g_fov_scale = ((double)w / (double)h) / (4.0 / 3.0);
         logf_("mode %dx%d, aspect scale %.4f", w, h, g_fov_scale);
         if (dlc_state == 0) {

@@ -73,7 +73,7 @@ depends on the platform:
 
 | | RenderD3D | RenderOpenGL |
 |---|---|---|
-| mac / CrossOver | any resolution, fullscreen + windowed | untested |
+| mac / CrossOver | any resolution; fullscreen becomes a borderless window at desktop resolution | untested |
 | Windows | max 2048px per axis (auto-clamped) | any resolution, fullscreen + windowed |
 
 On modern Windows the legacy Direct3D 7 HAL (emulated by `ddraw.dll`)
@@ -259,6 +259,33 @@ Three patch groups:
   an uninitialized height and the game dies with the "16bit colors"
   mode error, so the passthrough fixes stock fullscreen at non-ladder
   resolutions too.)
+- **Borderless fullscreen** (default under Wine/CrossOver) — exclusive
+  DirectDraw fullscreen is broken under the CrossOver Mac driver: the
+  emulated mode change renders oversized on scaled Retina desktops, the
+  exclusive-mode cursor clipping freezes the mouse, and alt-tab loses the
+  exclusive surfaces (permanent black window). When hitman.ini requests
+  fullscreen and `Borderless` is on (`-1` auto-enables it under Wine
+  only), the request is converted before the renderer loads: the
+  fullscreen flag is cleared and the resolution is replaced with the
+  current desktop size. The game's own windowed path already creates an
+  undecorated popup window, so this alone yields borderless fullscreen;
+  the window is only moved if its client area is not at 0,0 — its style
+  is never touched, because restyling a live DirectDraw device window
+  blacks out rendering under the CrossOver Mac driver. Real Windows keeps
+  exclusive fullscreen by default.
+
+  The in-game options screen stays usable with this: the desktop
+  resolution is added to its resolution list (the list, its labels and
+  the applied values all come from a static mode table in the renderer,
+  which is replaced with an extended copy through its accessor), and the
+  same fullscreen-to-borderless conversion is installed as a hook on the
+  renderer's mode-set path, so toggling fullscreen in the menu converts
+  on the fly instead of re-entering broken exclusive fullscreen. The
+  screen also opens with the mode actually running selected (stock
+  restores the selection from the saved profile — a hand-edited
+  hitman.ini shows up as the 800x600 default); the selection hook feeds
+  the matcher the live mode from ZSysInterface and writes it into the
+  options state, so applying without changes keeps the current mode.
 - **Resolution guard** — before the renderer runs mode selection, the
   requested resolution is validated: in fullscreen it must exist in the
   `EnumDisplaySettings` mode list, and with `RenderD3D` on real Windows
@@ -289,6 +316,9 @@ Config: `scripts/HC47Widescreen.ini`
 Enabled=1
 FOVFactor=1.0          ; extra factor on the gameplay camera FOV
 DrawDistanceFactor=1.0 ; 1.0 leaves the draw distance untouched
+Borderless=-1          ; fullscreen -> borderless window at desktop
+                       ; resolution: -1 auto (on under Wine, off on
+                       ; real Windows), 0 never, 1 always
 ```
 
 Install output:
