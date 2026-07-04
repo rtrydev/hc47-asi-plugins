@@ -1,0 +1,5 @@
+# 2026-07-04: per-frame game-time latch (prev=cur; cur=clock() or +=1/30).
+# HC47HudExtras entry-hooks this function (frame tick) and HC47FrameLimit
+# hooks the clock call site inside it (0xe309); translation would bypass
+# both. Two fadds per frame - no perf value.
+e2e0
