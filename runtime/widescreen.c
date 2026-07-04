@@ -33,6 +33,23 @@
  *  - Draw distance (optional): the far-clip float handed to the renderer
  *    at camera activation (0x24ec2) is scaled by DrawDistanceFactor.
  *
+ * Resolution guard: the passthrough exposes two failure modes the stock
+ * 4:3 ladder used to mask:
+ *  1. Fullscreen requires the requested mode to exist verbatim in the
+ *     driver's mode list; a miss throws "Unable to find a suitable
+ *     display mode for true color. Try changing to 16bit colors."
+ *     (Typical on CrossOver, whose mode list rarely contains the exact
+ *     hitman.ini resolution.)
+ *  2. On modern Windows the legacy D3D7 HAL refuses render targets
+ *     larger than 2048px per axis (CreateDevice -> D3DERR_INVALID_DEVICE
+ *     -> "Unable to initialize Direct3D"), in windowed AND fullscreen
+ *     mode alike. Wine/CrossOver has no such limit.
+ * So before the renderer runs mode selection, the requested resolution
+ * in ZSysInterface is validated: fullscreen resolutions must exist in
+ * the EnumDisplaySettings mode list, and with RenderD3D on real Windows
+ * (not Wine) the size must pass a Direct3D7 render-target probe; when a
+ * check fails the request is clamped to the best resolution that works.
+ *
  * A watchdog thread applies the renderer patch as soon as the renderer
  * module appears, applies the HitmanDlc patches once the display mode is
  * known, and rewrites the FOV constants if the mode changes at run time.
@@ -242,8 +259,9 @@ static int module_matches(HMODULE m, uint32_t stamp, uint32_t size)
 }
 
 /* Make the resolution-snap `je` unconditional in whichever renderer is
- * loaded. Returns 1 patched, -1 mismatch (give up), 0 not loaded yet. */
-static int patch_renderer_snap(void)
+ * loaded. Returns 1 patched, -1 mismatch (give up), 0 not loaded yet.
+ * On success *which is set to the RENDERERS index (0 = RenderD3D). */
+static int patch_renderer_snap(int *which)
 {
     for (int i = 0; i < 2; i++) {
         HMODULE m = GetModuleHandleA(RENDERERS[i].module);
@@ -264,9 +282,117 @@ static int patch_renderer_snap(void)
         if (!write_code(site, jmp6, 6)) return -1;
         logf_("%s: resolution snap disabled — hitman.ini resolution passes through",
               RENDERERS[i].module);
+        *which = i;
         return 1;
     }
     return 0;
+}
+
+/* ---- resolution guard ------------------------------------------------ */
+
+static int is_wine(void)
+{
+    return GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                          "wine_get_version") != NULL;
+}
+
+/* Maximum render-target axis for the legacy Direct3D7 HAL that modern
+ * Windows emulates: CreateDevice fails with D3DERR_INVALID_DEVICE above
+ * 2048px per axis, windowed and fullscreen alike (verified empirically:
+ * 2048x2048 works; 2560x1440, 3840x1080 and 1920x2160 all fail).
+ * Wine/CrossOver implements D3D7 natively and has no such limit. */
+#define D3D7_MAX_RT_AXIS 2048
+
+/* Which renderer will the game load? Parsed from hitman.ini in the game
+ * root (the parent of the scripts directory) so the guard can run before
+ * the renderer module even loads — probing DirectDraw concurrently with
+ * the game's own DirectDraw startup is not safe. */
+static int drawdll_is_d3d(void)
+{
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\..\\Hitman.ini", g_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return 1;
+    int d3d = 1;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (_strnicmp(p, "DrawDll", 7) != 0) continue;
+        d3d = strstr(p, "OpenGL") == NULL && strstr(p, "3DFX") == NULL;
+        break;
+    }
+    fclose(f);
+    return d3d;
+}
+
+/* Validate the hitman.ini resolution in ZSysInterface before the renderer
+ * runs display-mode selection; clamp it to the best working resolution
+ * when it cannot succeed. Runs once, as soon as the parsed resolution
+ * shows up in ZSysInterface (well before the renderer module loads). */
+static int guard_resolution(uint8_t *si)
+{
+    int32_t w, h;
+    uint8_t fullscreen = si[0x12];
+    memcpy(&w, si + 0x19, 4);
+    memcpy(&h, si + 0x1d, 4);
+    if (w < 320 || h < 200 || w > 16384 || h > 16384)
+        return 0;                         /* ini not parsed yet — retry */
+    int32_t limit = drawdll_is_d3d() && !is_wine() ? D3D7_MAX_RT_AXIS
+                                                   : 0x7fffffff;
+
+    int32_t bw = 0, bh = 0;               /* best replacement */
+
+    if (fullscreen) {
+        /* the mode list the renderer will match against */
+        DEVMODEA dm;
+        memset(&dm, 0, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        int exact = 0;
+        for (DWORD i = 0; EnumDisplaySettingsA(NULL, i, &dm); i++) {
+            if (dm.dmBitsPerPel < 32) continue;
+            int32_t mw = (int32_t)dm.dmPelsWidth, mh = (int32_t)dm.dmPelsHeight;
+            if (mw == w && mh == h) exact = 1;
+            /* candidate ranking: within the limit, prefer the requested
+             * aspect, then size */
+            if (mw > w || mh > h || mw > limit || mh > limit) continue;
+            int cand_asp = mw * h == mh * w;
+            int best_asp = bw && bh && bw * h == bh * w;
+            if (cand_asp != best_asp ? cand_asp
+                                     : (int64_t)mw * mh > (int64_t)bw * bh) {
+                bw = mw; bh = mh;
+            }
+        }
+        if (exact && w <= limit && h <= limit)
+            return 1;                     /* request is fine as-is */
+        if (exact)
+            logf_("fullscreen %dx%d exceeds the D3D7 render-target limit "
+                  "on this system", w, h);
+        else
+            logf_("fullscreen %dx%d not in the display mode list", w, h);
+    } else {
+        if (w <= limit && h <= limit)
+            return 1;                     /* windowed size works as-is */
+        logf_("windowed %dx%d exceeds the D3D7 render-target limit "
+              "on this system", w, h);
+        /* shrink aspect-preserving to fit the limit box */
+        double f = (double)limit / (w > h ? w : h);
+        bw = ((int32_t)(w * f) + 4) & ~7;
+        bh = ((int32_t)(h * f) + 4) & ~7;
+        if (bw > limit) bw = limit;
+        if (bh > limit) bh = limit;
+    }
+
+    if (!bw || !bh) {
+        logf_("no working replacement resolution found — leaving %dx%d", w, h);
+        return 1;
+    }
+    memcpy(si + 0x19, &bw, 4);
+    memcpy(si + 0x1d, &bh, 4);
+    logf_("resolution clamped %dx%d -> %dx%d (%s; use the OpenGL renderer "
+          "for larger sizes on Windows)", w, h, bw, bh,
+          fullscreen ? "fullscreen" : "windowed");
+    return 1;
 }
 
 static int g_push_ok;   /* push sites verified, safe to (re)write */
@@ -373,18 +499,27 @@ static DWORD WINAPI watch_thread(LPVOID arg)
     (void)arg;
     int snap_state = 0, dlc_state = 0;
     int snap_tries = 0;
+    int renderer = -1, guarded = 0;
+    (void)renderer;
     int32_t lastw = 0, lasth = 0;
     for (;;) {
         int settled = snap_state != 0 && dlc_state != 0;
-        Sleep(settled ? 250 : 25);
+        Sleep(settled ? 250 : guarded ? 25 : 5);
+        uint8_t *si = sysiface();
+        /* guard first: it must rewrite the requested resolution before
+         * the renderer creates its window, and its DirectDraw probe must
+         * not run concurrently with the game's own DirectDraw startup —
+         * both are safe this early because the renderer module has not
+         * been loaded yet when the parsed ini resolution appears */
+        if (si && !guarded)
+            guarded = guard_resolution(si);
         if (snap_state == 0) {
-            snap_state = patch_renderer_snap();
+            snap_state = patch_renderer_snap(&renderer);
             if (snap_state == 0 && ++snap_tries > 1600) {
                 logf_("no supported renderer module after 40s — resolution patch skipped");
                 snap_state = -1;
             }
         }
-        uint8_t *si = sysiface();
         if (!si) continue;
         int32_t w, h;
         memcpy(&w, si + SI_CURW, 4);
