@@ -84,6 +84,11 @@ class FuncInfo:
         self.jumptables = {}        # jmp VA -> (table_va, [target VAs])
         self.ret_depths = set()     # x87 depth at each ret
         self.verified_returns = set()  # call_returns proven by callee analysis
+        self.preserve_flags = set()  # compare VAs to wrap in pushfd/popfd:
+                                     # a later reader consumes pre-compare
+                                     # EFLAGS (MSVC interleaves x87 with int
+                                     # code; original fcom leaves EFLAGS
+                                     # alone, our ucomisd would clobber)
 
 
 # EFLAGS read/write masks from capstone metadata
@@ -98,6 +103,12 @@ for _n in dir(x86):
         _WRITE_MASK |= getattr(x86, _n)
 
 FLAG_READERS_EXTRA = {"pushf", "pushfd", "lahf"}
+
+# compares whose translation may be wrapped in pushfd/popfd to keep the
+# original EFLAGS visible across them; the fcomi family is excluded because
+# it writes EFLAGS in the original too (ucomisd matches it exactly)
+PRESERVABLE_COMPARES = {"fcom", "fcomp", "fcompp", "fucom", "fucomp",
+                        "fucompp", "ficom", "ficomp", "ftst"}
 
 REQ_TWO = {"fpatan", "fyl2x", "fyl2xp1", "fscale",
            "fcompp", "fucompp"}
@@ -288,6 +299,11 @@ class Analyzer:
             reads = bool(ef & _READ_MASK) or mnem in FLAG_READERS_EXTRA
             writes = bool(ef & _WRITE_MASK)
             if reads and not flags_ok:
+                clob = fi.insns.get(owner)
+                if clob is not None and owner not in fi.preserve_flags and \
+                        clob.mnemonic in PRESERVABLE_COMPARES:
+                    fi.preserve_flags.add(owner)
+                    raise _RetryWalk()
                 raise Reject("flags-clobber")
 
             if mnem == "call":
@@ -497,7 +513,10 @@ class Analyzer:
         fi.max_depth = max(fi.max_depth, depth)
         if mnem in x87.COMPARES:
             # translated to ucomisd: writes EFLAGS (diverges from original)
-            last_cmp, flags_ok, owner = va, False, va
+            # unless this site is marked for pushfd/popfd preservation
+            last_cmp = va
+            if va not in fi.preserve_flags:
+                flags_ok, owner = False, va
         elif mnem in ("fist", "fistp"):
             # translated form tests the shadow control word: writes EFLAGS
             flags_ok, owner = False, va

@@ -513,7 +513,15 @@ class FuncTranslator:
         if mnem in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp",
                     "ficom", "ficomp", "ftst", "fcomi", "fcomip",
                     "fucomi", "fucomip"):
+            # preserve: this site sits between an integer flag-writer and
+            # its reader (MSVC interleaving); wrap the ucomisd + snapshot
+            # in pushfd/popfd so the original EFLAGS survive. The pushfd
+            # must not enclose any esp-relative memory access, so operands
+            # are loaded into xmm7 first.
+            preserve = va in self.fi.preserve_flags
             if mnem == "ftst":
+                if preserve:
+                    self.emit(b"\x9C")
                 self.emit_data_mem(E_.UCOMISD, X(t), D_ZERO)
             elif mem is not None:
                 if mnem.startswith("fi"):
@@ -527,22 +535,35 @@ class FuncTranslator:
                         self.emit(E_.pop_r(free))
                     else:
                         raise TranslateError("ficom size")
+                    if preserve:
+                        self.emit(b"\x9C")
                     self.emit(E_.sse_rr(*E_.UCOMISD, X(t), 7))
                 elif msz == 4:
                     self.emit_mem(E_.sse_rm(*E_.CVTSS2SD, 7, mem))
+                    if preserve:
+                        self.emit(b"\x9C")
                     self.emit(E_.sse_rr(*E_.UCOMISD, X(t), 7))
                 elif msz == 8:
-                    self.emit_mem(E_.sse_rm(*E_.UCOMISD, X(t), mem))
+                    if preserve:
+                        self.emit_mem(E_.sse_rm(*E_.MOVSD_LOAD, 7, mem))
+                        self.emit(b"\x9C")
+                        self.emit(E_.sse_rr(*E_.UCOMISD, X(t), 7))
+                    else:
+                        self.emit_mem(E_.sse_rm(*E_.UCOMISD, X(t), mem))
                 else:
                     raise TranslateError("fcom size")
             else:
                 i = sts[-1] if sts else 1
+                if preserve:
+                    self.emit(b"\x9C")
                 self.emit(E_.sse_rr(*E_.UCOMISD, X(t), X(t - i)))
             # snapshot EFLAGS to TEB so any later fnstsw can read this
             # compare's result regardless of intervening flag writers
             # (pushfd + pop dword fs:[TEB]; touches no registers)
             self.emit(b"\x9C")
             self.emit(b"\x64\x8F\x05\x00\x00\x00\x00", [(3, TEB_AH, 0)])
+            if preserve:
+                self.emit(b"\x9D")
             return
 
         if mnem == "fsin":

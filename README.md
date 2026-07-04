@@ -47,8 +47,8 @@ speed. It uses an offline translator to rewrite provably-safe x87 functions
 into SSE2 double-precision code, then a small ASI loader installs 5-byte
 entry hooks when the matching game module loads.
 
-Current `HitmanDlc.dlc` coverage is about 66,000 of 89,000 x87 instructions
-across 1,187 functions. Anything not statically proven safe stays original:
+Current `HitmanDlc.dlc` coverage is about 73,000 of 89,000 x87 instructions
+across 1,382 functions. Anything not statically proven safe stays original:
 unsupported ops, unknown x87 stack depth, jump tables, MMX/SSE conflicts,
 EFLAGS hazards, and unbalanced call/return state are rejected.
 
@@ -71,6 +71,28 @@ Install output:
 
 Expected log after launch includes the number of applied hooks, for example
 `applied: 1187/1187 hooks`.
+
+### Diagnostic: EIP-sampling profiler (`HC47Profile.asi`)
+
+Not part of the default build. A sampling profiler for deciding where the
+remaining CrossOver/Rosetta time goes — untranslated x87 functions, other
+modules, or the graphics stack:
+
+```sh
+(cd runtime && make prof)
+cp dist/HC47Profile.asi "$HC47_GAME_DIR/scripts/"
+```
+
+It suspends each running game thread ~250 times per second, samples EIP via
+`GetThreadContext`, and appends a report to `scripts/HC47Profile.log` every
+10 s: per-module sample shares, the hottest 16-byte code buckets as
+`module+rva`, and — by following the installed entry hooks and the `.x87`
+func tables — per-function counts for translated code, keyed by original
+RVA. Because translated entries are hooked out of the module, samples inside
+game-module `.text` are untranslated code: the top-bucket list is the
+priority list for extending translation coverage. Fully idle threads are
+filtered out so Wine service threads don't flood the histogram. Remove the
+ASI when done; sampling costs a few percent of frame time.
 
 ### Precision Notes
 

@@ -104,10 +104,21 @@ static float rnd_float(void)
     return ldexpf(m, e);
 }
 
-static void fill_scratch(uint32_t seed)
+static void fill_scratch(uint32_t seed, int ptr_rich)
 {
     g_seed = seed;
     for (int i = 0; i < SCRATCH_WORDS; i++) {
+        if (ptr_rich) {
+            /* geometry-style contexts: small ints usable as indices and
+             * self-pointers so multi-level derefs stay inside scratch */
+            uint32_t r = rnd() % 100;
+            if (r < 25) { g_scratch_init[i] = rnd() % 48; continue; }
+            if (r < 40) {
+                g_scratch_init[i] = (uint32_t)(uintptr_t)
+                    &g_scratch[rnd() % (SCRATCH_WORDS - 256)];
+                continue;
+            }
+        }
         float f = rnd_float();
         memcpy(&g_scratch_init[i], &f, 4);
     }
@@ -151,7 +162,8 @@ static void restore_writable(void)
 
 static uint32_t g_last_args[16];
 
-static void run_one(void *fn, uint32_t seed, Result *res, uint32_t *mem_out)
+static void run_one(void *fn, uint32_t seed, int ptr_rich, Result *res,
+                    uint32_t *mem_out)
 {
     restore_writable();
     memcpy(g_scratch, g_scratch_init, sizeof(g_scratch));
@@ -165,6 +177,26 @@ static void run_one(void *fn, uint32_t seed, Result *res, uint32_t *mem_out)
     };
     uint32_t args[16];
     for (int i = 0; i < 16; i++) {
+        if (ptr_rich) {
+            /* pointers, index arrays, small ints, sentinels; no raw floats
+             * that would fault when treated as pointers or indices */
+            uint32_t k = rnd() % 8;
+            if (k < 2) {
+                args[i] = (uint32_t)(uintptr_t)
+                    &g_scratch[rnd() % (SCRATCH_WORDS - 256)];
+            } else if (k < 5) {
+                /* pointer to a quad of small ints, usable as an index
+                 * array over a scratch base pointer */
+                uint32_t z = rnd() % (SCRATCH_WORDS - 256);
+                for (int q = 0; q < 4; q++)
+                    g_scratch[z + q] = rnd() % 48;
+                args[i] = (uint32_t)(uintptr_t)&g_scratch[z];
+            } else if (k < 7)
+                args[i] = rnd() % 16;
+            else
+                args[i] = 0xFFFFFFFFu;   /* common count sentinel */
+            continue;
+        }
         uint32_t k = rnd() % 4;
         if (k == 0)
             args[i] = (uint32_t)(uintptr_t)&g_scratch[(rnd() % (SCRATCH_WORDS - 64))];
@@ -207,9 +239,14 @@ static uint32_t memA[SCRATCH_WORDS], memB[SCRATCH_WORDS];
 int main(int argc, char **argv)
 {
     if (argc < 4) {
-        printf("usage: difftest <module.dll> <patch.x87> <leaf.txt> [maxfuncs]\n");
+        printf("usage: difftest <module.dll> <patch.x87> <leaf.txt> "
+               "[maxfuncs] [rich]\n");
         return 2;
     }
+    /* "rich" adds pointer/index-array argument rounds. They reach much
+     * deeper into pointer-walking functions but can crash the tester
+     * itself on hostile counts — use for targeted funcs, not full sweeps. */
+    int rich = argc > 5 && !strcmp(argv[5], "rich");
     g_helpers[0] = hlp_sin;   g_helpers[1] = hlp_cos;
     g_helpers[2] = hlp_sincos; g_helpers[3] = hlp_tan;
     g_helpers[4] = hlp_atan2; g_helpers[5] = hlp_yl2x;
@@ -290,13 +327,19 @@ int main(int argc, char **argv)
         void *orig = base + fr->rva;
         void *xlat = blob + fr->blob_off;
         int func_ok = 1, func_ran = 0;
-        for (int round = 0; round < 6 && func_ok; round++) {
+        for (int round = 0; round < (rich ? 30 : 6) && func_ok; round++) {
+            int ptr_rich = round >= 6;
             uint32_t seed = leaf[i] * 2654435761u + round;
-            fill_scratch(seed);
+            fill_scratch(seed, ptr_rich);
             Result ra, rb;
-            run_one(orig, seed, &ra, memA);
-            run_one(xlat, seed, &rb, memB);
+            run_one(orig, seed, ptr_rich, &ra, memA);
+            run_one(xlat, seed, ptr_rich, &rb, memB);
             if (ra.faulted || rb.faulted) {
+                if (ra.faulted == rb.faulted)
+                    fprintf(stderr, "  r%d both-fault code=%08x @%08x "
+                            "(orig rva+%x)\n", round, ra.fault_code,
+                            ra.fault_addr,
+                            ra.fault_addr - (uint32_t)(uintptr_t)base);
                 if (ra.faulted != rb.faulted) {
                     printf("MISMATCH %05x r%d: fault orig=%u(%08x@%08x) "
                            "xlat=%u(%08x@%08x) [mod=%p blob=%p]\n",

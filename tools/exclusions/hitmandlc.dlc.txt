@@ -1,5 +1,7 @@
 # range-sensitive / unverifiable CRT math (see exclusions/README.md)
 # proven divergent under denormal inputs: 1b9c90, 1bc480
+# 2026-07-04: 1bdbc0, 1c4040 removed after passing targeted difftest
+# (rich pointer/index rounds); both are per-frame hot per EIP profiler
 1a0ab0
 1a0c70
 1a0d50
@@ -64,7 +66,6 @@
 1bcfd0
 1bd0b0
 1bd710
-1bdbc0
 1bf4c0
 1bf6b0
 1bf860
@@ -75,7 +76,6 @@
 1c2f20
 1c3a50
 1c3ee0
-1c4040
 1c46b0
 1c47e0
 1c4900

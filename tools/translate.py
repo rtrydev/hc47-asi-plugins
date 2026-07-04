@@ -64,6 +64,9 @@ def main():
                     help="round every arithmetic result to float (PC=single)")
     ap.add_argument("--include-all", action="store_true",
                     help="ignore all exclusion lists (testing only)")
+    ap.add_argument("--include", default="",
+                    help="comma-separated function RVAs (hex) to translate "
+                         "even if an exclusion list names them")
     args = ap.parse_args()
 
     path = os.path.join(args.game, args.module)
@@ -89,6 +92,10 @@ def main():
                     if line:
                         excl_rvas.add(int(line, 16))
             print(f"loaded {excl_file}")
+    incl_rvas = {int(x, 16) for x in args.include.split(",") if x}
+    if incl_rvas:
+        print(f"exclusion override: {sorted(hex(r) for r in incl_rvas)}")
+        excl_rvas -= incl_rvas
 
     # safety: don't hook functions whose first 5 bytes are a branch target
     tgts = branch_targets(mod)
