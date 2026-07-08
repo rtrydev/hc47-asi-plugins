@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run the differential tester inside the CrossOver Steam bottle.
 set -e
-GAME="${HC47_GAME_DIR:-/Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47}"
+GAME="${HC47_GAME_DIR:-$HOME/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47}"
 GAME_WIN='C:\Program Files (x86)\Steam\steamapps\common\Hitman Codename 47'
 WINE="/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine"
 HERE="$(cd "$(dirname "$0")" && pwd)"

@@ -12,8 +12,9 @@ from hc47x87 import analysis, x87
 GAME = os.environ.get("HC47_GAME_DIR") or (
     "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Hitman Codename 47"
     if os.name == "nt" else
-    "/Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/"
-    "drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47")
+    os.path.expanduser(
+        "~/Library/Application Support/CrossOver/Bottles/Steam/"
+        "drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47"))
 
 
 def census(mod):

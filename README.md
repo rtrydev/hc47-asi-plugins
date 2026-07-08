@@ -59,7 +59,7 @@ section below.
 By default `install.sh` targets the platform's default Steam install:
 
 ```text
-mac:     /Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47
+mac:     $HOME/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman Codename 47
 Windows: C:\Program Files (x86)\Steam\steamapps\common\Hitman Codename 47
 ```
 
