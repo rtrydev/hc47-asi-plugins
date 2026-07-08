@@ -283,6 +283,29 @@ static int g_applied;
 static int32_t g_vw, g_vh;          /* virtual size we maintain */
 static int32_t g_realw, g_realh;    /* last seen real mode */
 
+/* HC47Widescreen handshake: its exported HC47_ModeChangeTick holds a
+ * GetTickCount stamp while an in-game mode change is staged/consumed.
+ * The renderer re-init reads +0x19/+0x1d back as the DISPLAY MODE in
+ * that window — re-applying the virtual size then makes the game come
+ * up in a mode of the virtual size (GUI ends up at scale² too small).
+ * A stamp older than 3s is treated as stale (renderer paths without
+ * the end-of-consumption hook), so a missed clear cannot wedge us. */
+static volatile DWORD *g_ws_tick;
+
+static int modechange_inflight(void)
+{
+    if (!g_ws_tick) {
+        HMODULE m = GetModuleHandleA("HC47Widescreen.asi");
+        if (m)
+            g_ws_tick = (volatile DWORD *)(uintptr_t)
+                GetProcAddress(m, "HC47_ModeChangeTick");
+        if (!g_ws_tick)
+            return 0;
+    }
+    DWORD t = *g_ws_tick;
+    return t != 0 && GetTickCount() - t < 3000;
+}
+
 /* Apply (or re-apply) the virtual size. Only safe once HitmanDlc.dlc is
  * loaded: before that the current-mode fields merely mirror the request
  * (mode selection has not run) and shrinking the request would make the
@@ -311,7 +334,7 @@ static void try_apply(void)
               g_realw, g_realh, g_vw, g_vh, (double)g_scale);
         g_applied = 0;
     }
-    if (w != g_vw || h != g_vh) {
+    if ((w != g_vw || h != g_vh) && !modechange_inflight()) {
         memcpy(si + SI_WIDTH, &g_vw, 4);
         memcpy(si + SI_HEIGHT, &g_vh, 4);
         if (!g_applied)

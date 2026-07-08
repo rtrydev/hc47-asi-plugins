@@ -374,6 +374,29 @@ static volatile LONG g_bar_fills;    /* presents that still colorfill the
                                         CrossOver Mac driver; 4 strips
                                         per frame took 60fps to ~22) */
 
+/* Cross-plugin handshake with HC47HudScale: a GetTickCount stamp,
+ * nonzero from the moment an in-game mode change is staged until the
+ * renderer has consumed the ZSysInterface layout fields (+0x19/+0x1d)
+ * for the new mode. HudScale normally keeps its virtual GUI size in
+ * those fields and re-applies it whenever the game rewrites them — but
+ * during a re-init the renderer reads them back as the DISPLAY MODE, so
+ * a mid-flight re-apply gets adopted as the mode (observed: a 1800x1012
+ * apply came up as a 900x506 mode with the GUI at quarter size, halving
+ * again on every apply). HudScale holds off while this is set and
+ * treats a stamp older than ~3s as stale, so renderer paths without the
+ * capture hook (OpenGL, letterbox off) cannot wedge it. */
+__declspec(dllexport) volatile DWORD HC47_ModeChangeTick;
+
+static void modechange_begin(void)
+{
+    HC47_ModeChangeTick = GetTickCount() | 1;
+}
+
+static void modechange_end(void)
+{
+    HC47_ModeChangeTick = 0;
+}
+
 static double g_fov_scale = 1.0;   /* aspect / (4/3), read by hook callbacks */
 static double g_cut_out;           /* cutscene FOV, radians, set per call */
 static float g_scope_out;          /* scope FOV, radians, set per call */
@@ -701,13 +724,31 @@ void __cdecl reslist_entry(uint32_t *regs)
 
 /* Runs at the renderer's window-create/mode-set path on every (re)init —
  * including the in-game options apply, which re-requests fullscreen when
- * the player toggles it in the menu. */
+ * the player toggles it in the menu. This site (the flipped 4:3-snap je)
+ * sits BEFORE the attach code copies +0x19/+0x1d into the current-mode
+ * fields (+0x21/+0x25 at rva 0x29476) and sizes the window from them, so
+ * it is the last safe moment to make sure those fields hold the REAL
+ * mode: HC47HudScale keeps its virtual GUI size in them, and a re-init
+ * that reads the virtual size adopts it as the display mode. */
 void __cdecl reinit_entry(uint32_t *regs)
 {
     (void)regs;
     uint8_t *si = sysiface();
-    if (si)
-        convert_to_borderless(si, "renderer re-init");
+    if (!si)
+        return;
+    modechange_begin();
+    if (g_borderless_active && g_fit_w >= 320 && g_fit_h >= 200) {
+        int32_t w, h;
+        memcpy(&w, si + 0x19, 4);
+        memcpy(&h, si + 0x1d, 4);
+        if (w != g_fit_w || h != g_fit_h) {
+            memcpy(si + 0x19, &g_fit_w, 4);
+            memcpy(si + 0x1d, &g_fit_h, 4);
+            logf_("renderer re-init: mode %dx%d restored over the GUI "
+                  "virtual size %dx%d", g_fit_w, g_fit_h, w, h);
+        }
+    }
+    convert_to_borderless(si, "renderer re-init");
 }
 
 /* Replaces the renderer interface's SetResolution (vtbl+0xc) wholesale —
@@ -732,6 +773,7 @@ void __cdecl setres_entry(uint32_t *regs)
         return;
     int32_t w = req[0], h = req[1], bpp = req[2];
     int fs = req[3] != 0;
+    modechange_begin();
     logf_("in-game mode request %dx%d bpp %d %s", w, h, bpp,
           fs ? "fullscreen" : "windowed");
     int32_t dw, dh;
@@ -761,8 +803,13 @@ void __cdecl setres_entry(uint32_t *regs)
     }
     int dirty = 0;
     int32_t cur;
+    /* change detection against the CURRENT-mode fields (+0x21/+0x25),
+     * not the layout fields the stock code compares (+0x19/+0x1d): under
+     * HC47HudScale the layout fields hold the virtual GUI size, which
+     * would flag every same-mode re-apply (e.g. the settings-confirm
+     * commit) as a change and force a needless window recreate */
     const struct { int32_t val; int curoff, pendoff; } f[3] = {
-        { w, 0x19, 0x21 }, { h, 0x1d, 0x25 }, { bpp, 0x29, 0x2d },
+        { w, 0x21, 0x21 }, { h, 0x25, 0x25 }, { bpp, 0x29, 0x2d },
     };
     for (int i = 0; i < 3; i++) {
         memcpy(&cur, si + f[i].curoff, 4);
@@ -771,10 +818,12 @@ void __cdecl setres_entry(uint32_t *regs)
         if (f[i].val != cur)
             dirty = 1;
     }
-    if ((uint8_t)fs != si[0x12]) {
-        si[0x13] = (uint8_t)fs;
+    if ((uint8_t)fs != si[0x12])
         dirty = 1;
-    }
+    /* always write the pending byte, like the stock code: the re-init
+     * copies +0x13 to +0x12 unconditionally, so a stale value here
+     * would resurrect a long-dead fullscreen request */
+    si[0x13] = (uint8_t)fs;
     if (dirty)
         si[0x38ed] = 1;
 }
@@ -840,6 +889,9 @@ void __cdecl sizeset_entry(uint32_t *regs)
 void __cdecl capture_entry(uint32_t *regs)
 {
     uint8_t *obj = (uint8_t *)(uintptr_t)regs[1];    /* esi */
+    modechange_end();                    /* surfaces are being built from
+                                            the consumed mode: HudScale
+                                            may reclaim +0x19/+0x1d */
     if (!g_borderless_active || !g_letterbox)
         return;                          /* full-client capture is correct */
     if (g_fit_w < 320 || g_fit_h < 200)
@@ -1320,6 +1372,24 @@ static int patch_renderer_snap(int *which)
         if (!hook_site(site, 6, stub)) return -1;
         logf_("%s: resolution snap disabled — hitman.ini resolution passes through",
               RENDERERS[i].module);
+        /* Pin the module before installing anything further: the in-game
+         * mode change (System.dll 0xd4f0, ZSysInterface vtbl+0xec)
+         * destroys the renderer interface, has System's DLL manager
+         * FreeLibrary the renderer module, and reloads it fresh for the
+         * re-init — which would wipe every patch in it. The stock 4:3
+         * snap ladder then shrank the staged letterbox mode to a small
+         * 4:3 window, and with the SetResolution hook gone g_req went
+         * stale, so the ini wrap kept saving the old resolution. One
+         * extra reference makes the unload a no-op: the reload yields
+         * this same, still-patched image (and ReducedX87's translations
+         * of the module survive too). */
+        char pin[MAX_PATH];
+        if (GetModuleFileNameA(m, pin, sizeof(pin)) && LoadLibraryA(pin))
+            logf_("%s pinned — patches survive the in-game mode-change "
+                  "reload", RENDERERS[i].module);
+        else
+            logf_("%s: pin failed — an in-game resolution change will "
+                  "drop these patches", RENDERERS[i].module);
         inject_menu_mode(&RENDERERS[i], (uint8_t *)m);
         patch_letterbox(&RENDERERS[i], (uint8_t *)m);
         patch_setres(&RENDERERS[i], (uint8_t *)m);
