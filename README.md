@@ -266,26 +266,79 @@ Three patch groups:
   exclusive surfaces (permanent black window). When hitman.ini requests
   fullscreen and `Borderless` is on (`-1` auto-enables it under Wine
   only), the request is converted before the renderer loads: the
-  fullscreen flag is cleared and the resolution is replaced with the
-  current desktop size. The game's own windowed path already creates an
-  undecorated popup window, so this alone yields borderless fullscreen;
-  the window is only moved if its client area is not at 0,0 — its style
+  fullscreen flag is cleared and the request becomes a windowed mode.
+  The game's own windowed path already creates an undecorated popup
+  window, so this alone yields borderless fullscreen; the window's style
   is never touched, because restyling a live DirectDraw device window
   blacks out rendering under the CrossOver Mac driver. Real Windows keeps
   exclusive fullscreen by default.
+- **Aspect preservation** (`PreserveAspectRatio=1`, default) — a
+  converted fullscreen request keeps the aspect ratio of the resolution
+  you picked instead of stretching to the desktop's: the game renders at
+  the largest matching-aspect size that fits the desktop minus its top
+  menu-bar/notch band (so the image never sits under a MacBook notch;
+  the Dock is deliberately covered, not avoided), centered, with black
+  bars filling the rest of the desktop including the notch band. The
+  bars are colorfilled in a short burst after each mode init and
+  refreshed periodically — never per frame, which costs real frame rate
+  on this present path — with the window's black background brush
+  covering ordinary repaints. Requests whose aspect nearly matches the
+  desktop's still fill the whole screen. The whole letterbox
+  lives inside the game's own window and present path — no helper
+  windows: the single `MoveWindow` call that sizes the game window is
+  hooked so the window always covers the desktop (which also keeps its
+  `WS_EX_CLIENTEDGE` ring — the classic "white stripes" — entirely
+  off-screen), the renderer's cached blit rect and backbuffer size are
+  retargeted to the centered fit at capture time, and the per-frame
+  present black-fills the bar areas on the primary surface with
+  `DDBLT_COLORFILL` blits (self-healing; the window class background is
+  black as well). The engine's relative-mouse math is clamped to the fit
+  mode, and the cursor needs no coordinate compensation (it is
+  delta-based). `PreserveAspectRatio=0` restores the old fill-the-desktop
+  behavior. Letterboxing works with `RenderD3D` (the default renderer);
+  `RenderOpenGL` falls back to desktop fill.
+- **Modern resolution list** (`ModernResolutionList=1`, default) — the
+  options menu's resolution list, its labels and the applied values all
+  come from a static mode table in the renderer holding only the 1999
+  4:3 ladder (640x480 .. 1600x1200). The table is replaced (through its
+  accessor, with a rebuilt copy) by the resolutions modern games ship —
+  16:9 (1280x720 .. 3840x2160), 16:10 (1280x800 .. 2560x1600) and 21:9
+  (2560x1080, 3440x1440) sets — filtered to what can work: with
+  exclusive fullscreen possible (real Windows) each entry must exist in
+  the driver's display-mode list, and `RenderD3D` on real Windows caps
+  both axes at the D3D7 HAL's 2048px limit. The desktop resolution
+  (under borderless) and the startup hitman.ini resolution are always
+  kept in the list. `ModernResolutionList=0` keeps the stock table.
 
-  The in-game options screen stays usable with this: the desktop
-  resolution is added to its resolution list (the list, its labels and
-  the applied values all come from a static mode table in the renderer,
-  which is replaced with an extended copy through its accessor), and the
-  same fullscreen-to-borderless conversion is installed as a hook on the
-  renderer's mode-set path, so toggling fullscreen in the menu converts
-  on the fly instead of re-entering broken exclusive fullscreen. The
-  screen also opens with the mode actually running selected (stock
-  restores the selection from the saved profile — a hand-edited
-  hitman.ini shows up as the 800x600 default); the selection hook feeds
-  the matcher the live mode from ZSysInterface and writes it into the
-  options state, so applying without changes keeps the current mode.
+  The in-game options screen composes with all of this: the
+  fullscreen-to-borderless conversion is installed inside the renderer's
+  `SetResolution` (the staging path every menu apply goes through), so
+  changing resolution in the menu converts on the fly instead of
+  re-entering broken exclusive fullscreen, and the re-init re-applies
+  the window sizing and letterbox geometry automatically. Under
+  borderless every menu apply is treated as a fullscreen pick no matter
+  what the "Full screen" checkbox says — the conversion cleared the
+  engine's fullscreen flag, so the options screen always reports
+  "windowed" and honoring that literally would size a real window to
+  the picked resolution (e.g. 1920x1200 on a 1800x1169 desktop, which
+  the Mac WM clamps into a sheared mess). The checkbox is effectively a
+  no-op there; a real small window needs `Borderless=0`. The screen also opens with the resolution you actually
+  picked selected and labeled: the selection hook resolves the exact
+  width+height entry itself (the stock matcher compares widths only,
+  which mis-highlights lists carrying both 1920x1080 and 1920x1200,
+  and the stock screen seeds its values from live engine fields that
+  other plugins repurpose) and writes the "N x N" label text directly —
+  the stock game only updates that label when the slider is dragged, so
+  it otherwise keeps showing the layout's stale "640 x 480" placeholder
+  no matter what is selected, applied, or saved.
+- **Settings persistence** — the game rewrites hitman.ini itself (on
+  options applies and on exit) from the same `ZSysInterface` fields the
+  conversion rewrites, which used to clobber the file with the converted
+  values ("Window" + desktop/fit resolution) and lose your preference.
+  The single writer function (in EngineData.dll) is wrapped: the
+  resolution and fullscreen preference you picked are swapped into place
+  for the duration of the write, so hitman.ini always round-trips what
+  you chose.
 - **Resolution guard** — before the renderer runs mode selection, the
   requested resolution is validated: in fullscreen it must exist in the
   `EnumDisplaySettings` mode list, and with `RenderD3D` on real Windows
@@ -319,6 +372,11 @@ DrawDistanceFactor=1.0 ; 1.0 leaves the draw distance untouched
 Borderless=-1          ; fullscreen -> borderless window at desktop
                        ; resolution: -1 auto (on under Wine, off on
                        ; real Windows), 0 never, 1 always
+PreserveAspectRatio=1  ; borderless keeps the aspect ratio of the chosen
+                       ; resolution, centered with black bars; 0
+                       ; stretches to the desktop aspect
+ModernResolutionList=1 ; replace the options menu's 4:3 mode table with
+                       ; common modern resolutions; 0 keeps the stock list
 ```
 
 Install output:
