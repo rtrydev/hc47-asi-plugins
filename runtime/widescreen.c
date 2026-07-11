@@ -272,19 +272,26 @@ static const struct renderer_site {
                                 to [obj+0xbdd] on the primary ([obj+0x95d],
                                 clipper-attached); the hook colorfills the
                                 letterbox bars first */
-    uint32_t initok;         /* D3D-environment init success (device and
-                                surfaces exist, mode consumed): releases
-                                the mode-change handshake on every path —
-                                the capture hook only covers the windowed
-                                letterbox one, and exclusive fullscreen
-                                otherwise leaves HudScale waiting out its
-                                3s staleness timeout, past the GUI
-                                relayout. 0 = staleness timeout only */
+    uint32_t initok;         /* renderer-environment init success (device/
+                                context exists, mode consumed): releases
+                                the mode-change handshake — the capture
+                                hook only covers the windowed letterbox
+                                path — and hands the layout fields back
+                                to HudScale synchronously, before the
+                                engine re-lays the open screens out for
+                                the new mode. 0 = staleness timeout only */
+    uint32_t initok_str;     /* nonzero: the site is `push <va of this
+                                string rva>` ("Initialized OpenGL
+                                environment.") — the expect bytes are
+                                built against the live base. 0: the site
+                                matches the static INITOK_BYTES */
 } RENDERERS[2] = {
     { "RenderD3D.dll",    0x3a3e1338, 0x4d000, 0x29363, 0x298c0, 0x3d178,
-      0x298d0, 0x35030, 0x2959c, 0x3515c, 0x24ac0, 0x70b7, 0x7770, 0x1f07 },
+      0x298d0, 0x35030, 0x2959c, 0x3515c, 0x24ac0, 0x70b7, 0x7770,
+      0x1f07, 0 },
     { "RenderOpenGL.dll", 0x3a3e1318, 0x56000, 0x2b913, 0x2be70, 0x36d28,
-      0x2be80, 0x2f028, 0, 0, 0, 0, 0, 0 },
+      0x2be80, 0x2f028, 0, 0, 0, 0, 0,
+      0x1918, 0x325a8 },
 };
 
 /* SetResolution after the `mov eax,[glob]` the hook replaces:
@@ -333,9 +340,13 @@ static const uint8_t PRESENT_BYTES[22] = {
 };
 #define PRESENT_HOOK_LEN 9
 
-/* Init-OK tail (rva 0x1f07, just past the failure branch that raises
- * "Unable to initialize Direct3D"): mov edx,[ebp+0x971] — position-
- * independent, stolen whole. */
+/* Init-OK tails. RenderD3D (rva 0x1f07, just past the failure branch
+ * that raises "Unable to initialize Direct3D"): mov edx,[ebp+0x971] —
+ * position-independent, stolen whole. RenderOpenGL has no static
+ * pattern: its site (rva 0x1918, at the tail of the environment init,
+ * three instructions before its ret) is the 5-byte
+ * `push "Initialized OpenGL environment."` — the absolute string
+ * operand is computed against the live base (initok_str above). */
 static const uint8_t INITOK_BYTES[6] = { 0x8b, 0x95, 0x71, 0x09, 0x00, 0x00 };
 
 #define DDBLT_COLORFILL 0x00000400
@@ -491,6 +502,8 @@ static int borderless_wanted(void)
 {
     return g_borderless == 1 || (g_borderless == -1 && is_wine());
 }
+
+static int display_mode_exists(int32_t w, int32_t h);
 
 static int desktop_size(int32_t *w, int32_t *h)
 {
@@ -841,6 +854,15 @@ void __cdecl setres_entry(uint32_t *regs)
     int fs = req[3] != 0;
     logf_("in-game mode request %dx%d bpp %d %s", w, h, bpp,
           fs ? "fullscreen" : "windowed");
+    /* A request that is no real display mode but matches the virtual
+     * GUI size of the current/previous mode is an engine echo of
+     * snapshotted layout fields (observed: the options screen's Cancel
+     * after a resolution change) — a player pick always comes from the
+     * mode table. Translate it back or the re-init adopts the virtual
+     * size as the display mode (mode at 1/scale, GUI at 1/scale²). */
+    if (!display_mode_exists(w, h) && hc47_hudscale_unvirtual(&w, &h))
+        logf_("request was a snapshotted virtual GUI size — translated "
+              "to the real mode %dx%d", w, h);
     int32_t dw, dh;
     if (borderless_wanted() && desktop_size(&dw, &dh)) {
         /* Under borderless EVERY apply is treated as a fullscreen pick,
@@ -1003,18 +1025,22 @@ void __cdecl capture_entry(uint32_t *regs)
           g_fit_x, g_fit_y, g_fit_w, g_fit_h, g_fit_w, g_fit_h);
 }
 
-/* Runs when the renderer's D3D-environment init succeeds (exclusive
- * fullscreen and windowed alike): the staged mode has been fully
- * consumed and the device exists, so HudScale may reclaim the layout
- * fields immediately instead of waiting out its staleness timeout —
- * which would land the virtual GUI size AFTER the mode change relaid
- * the GUI out, rendering it scaled off screen. The windowed letterbox
+/* Runs when the renderer's environment init succeeds (D3D and OpenGL,
+ * exclusive fullscreen and windowed alike): the staged mode has been
+ * fully consumed and the device/context exists, so HudScale reclaims
+ * the layout fields RIGHT HERE, before control returns to the engine —
+ * the engine's post-mode-change code re-lays the open screens out
+ * against those fields, and any window in which they still hold the
+ * real mode lays the active screen out oversized (observed: settings
+ * screen zoomed off the bottom-right corner after an in-game
+ * resolution change, unusable until rebuilt). The windowed letterbox
  * path also ends the handshake at the capture hook; ending twice is
  * harmless. */
 void __cdecl initok_entry(uint32_t *regs)
 {
     (void)regs;
     modechange_end();
+    hc47_hudscale_apply();
 }
 
 /* Runs at the per-frame present entry. While letterboxing (windowed,
@@ -1521,11 +1547,23 @@ static int patch_renderer_snap(int *which)
         inject_menu_mode(&RENDERERS[i], (uint8_t *)m);
         patch_letterbox(&RENDERERS[i], (uint8_t *)m);
         patch_setres(&RENDERERS[i], (uint8_t *)m);
-        if (RENDERERS[i].initok)
+        if (RENDERERS[i].initok) {
+            uint8_t expect[8];
+            size_t elen;
+            if (RENDERERS[i].initok_str) {
+                uint32_t va = (uint32_t)(uintptr_t)
+                    ((uint8_t *)m + RENDERERS[i].initok_str);
+                expect[0] = 0x68;                 /* push imm32 */
+                memcpy(expect + 1, &va, 4);
+                elen = 5;
+            } else {
+                memcpy(expect, INITOK_BYTES, sizeof(INITOK_BYTES));
+                elen = sizeof(INITOK_BYTES);
+            }
             hook_with_replay("renderer init-OK (handshake release)",
                              (uint8_t *)m + RENDERERS[i].initok,
-                             INITOK_BYTES, sizeof(INITOK_BYTES),
-                             sizeof(INITOK_BYTES), (void *)initok_entry);
+                             expect, elen, elen, (void *)initok_entry);
+        }
         /* the letterbox hooks did not all land (or OpenGL): fall back to
          * filling the desktop so the image is never sheared */
         if (g_preserve_aspect && borderless_wanted() && !g_letterbox_ok) {

@@ -19,7 +19,11 @@
  *
  * Config (hc47_tweaks.ini):
  *   [HudScale]
- *   Scale=2.0        ; 1.0 = off; fractional values fine (e.g. 1.5)
+ *   Scale=2.0        ; 1.0 = off; fractional values fine (e.g. 1.5).
+ *                    ; An upper bound: the effective scale is clamped
+ *                    ; per display mode so the virtual GUI size never
+ *                    ; drops below 640x480 (the layouts' authored
+ *                    ; minimum) — e.g. 2.0 acts as 1.5 at 1280x720.
  *   SharpText=1      ; re-rasterize TTF fonts at the real pixel size
  *
  * Timing matters: the renderer copies the requested resolution into the
@@ -280,6 +284,32 @@ static CRITICAL_SECTION g_applylock;
 static int g_applied;
 static int32_t g_vw, g_vh;          /* virtual size we maintain */
 static int32_t g_realw, g_realh;    /* last seen real mode */
+static int32_t g_prevw, g_prevh;    /* real mode before the last change */
+static int32_t g_prevvw, g_prevvh;  /* and the virtual size it used */
+
+/* The GUI layouts are authored for a 640x480 minimum (the engine's
+ * default screen size): a virtual size below that lays menu elements
+ * out past the screen edge (observed: at 1280x720 with Scale=2 the
+ * options screen's bottom button row landed below the 640x360 virtual
+ * screen). Clamp the effective scale per mode so the virtual size never
+ * drops under 640x480 — the configured scale simply becomes "at most".
+ * SharpText intentionally keeps rasterizing at the CONFIGURED scale:
+ * its label-geometry compensation is relative to the raster scale, not
+ * the GUI magnification, so text keeps its layout size at any effective
+ * scale and is merely supersampled when the clamp bites. */
+#define MIN_VIRTUAL_W 640
+#define MIN_VIRTUAL_H 480
+
+static float eff_scale(int32_t w, int32_t h)
+{
+    float s = g_scale;
+    float m = (float)w / (float)MIN_VIRTUAL_W;
+    float mh = (float)h / (float)MIN_VIRTUAL_H;
+    if (mh < m) m = mh;
+    if (s > m) s = m;
+    if (s < 1.0f) s = 1.0f;
+    return s;
+}
 
 /* Widescreen handshake: HC47_ModeChangeTick (widescreen.c) holds a
  * GetTickCount stamp while an in-game mode change is staged/consumed.
@@ -315,11 +345,18 @@ static void try_apply(void)
     }
     if (curw != g_realw || curh != g_realh) {
         /* first mode-set, or the mode changed */
+        g_prevw = g_realw;
+        g_prevh = g_realh;
+        g_prevvw = g_vw;
+        g_prevvh = g_vh;
         g_realw = curw; g_realh = curh;
-        g_vw = (int32_t)lroundf((float)g_realw / g_scale);
-        g_vh = (int32_t)lroundf((float)g_realh / g_scale);
-        logf_("mode %dx%d -> virtual GUI %dx%d (scale %.3f)",
-              g_realw, g_realh, g_vw, g_vh, (double)g_scale);
+        float eff = eff_scale(curw, curh);
+        g_vw = (int32_t)lroundf((float)g_realw / eff);
+        g_vh = (int32_t)lroundf((float)g_realh / eff);
+        logf_("mode %dx%d -> virtual GUI %dx%d (scale %.3f%s)",
+              g_realw, g_realh, g_vw, g_vh, (double)eff,
+              eff != g_scale ? ", clamped so the GUI keeps >= 640x480"
+                             : "");
         g_applied = 0;
     }
     if ((w != g_vw || h != g_vh) && !modechange_inflight()) {
@@ -333,6 +370,59 @@ static void try_apply(void)
         g_applied = 1;
     }
     LeaveCriticalSection(&g_applylock);
+}
+
+/* Called by widescreen's SetResolution replacement: a mode request that
+ * equals the virtual GUI size of the current or the previous real mode
+ * is an engine path echoing back snapshotted layout fields, not a
+ * player pick (observed: the options screen's Cancel after a resolution
+ * change restores the PRE-CHANGE +0x19/+0x1d — the old virtual size —
+ * which the re-init then adopts as a real display mode at 1/scale).
+ * Rewrite it to the corresponding real mode. The caller has already
+ * checked the request against the display-mode list, so a legitimate
+ * pick (always a real mode) can never be translated. Returns 1 when
+ * translated. */
+int hc47_hudscale_unvirtual(int32_t *w, int32_t *h)
+{
+    if (g_scale == 1.0f)
+        return 0;               /* feature off (lock not initialized) */
+    int ret = 0;
+    EnterCriticalSection(&g_applylock);
+    /* compare against the virtual sizes actually used (the effective
+     * scale is clamped per mode, so they cannot be recomputed from the
+     * configured scale alone) */
+    const int32_t vw[2] = { g_vw, g_prevvw };
+    const int32_t vh[2] = { g_vh, g_prevvh };
+    const int32_t rw[2] = { g_realw, g_prevw };
+    const int32_t rh[2] = { g_realh, g_prevh };
+    for (int i = 0; i < 2 && !ret; i++) {
+        if (rw[i] < 320 || rh[i] < 200 || vw[i] < 320 || vh[i] < 200)
+            continue;
+        if (*w == vw[i] && *h == vh[i] &&
+            (*w != rw[i] || *h != rh[i])) {
+            *w = rw[i];
+            *h = rh[i];
+            ret = 1;
+        }
+    }
+    LeaveCriticalSection(&g_applylock);
+    return ret;
+}
+
+/* Called by widescreen's renderer init-OK hooks, on the game's own
+ * thread, the instant a (re)init has consumed the layout fields (the
+ * handshake was just cleared): reclaim them for the virtual GUI size
+ * BEFORE control returns to the engine, whose post-mode-change code
+ * re-lays the open screens out against whatever the fields hold.
+ * Leaving that to the polling watchdog let the settings screen lay
+ * itself out against the REAL mode and then render normalized by the
+ * virtual size — zoomed off the bottom-right corner, mouse mapping
+ * equally off, until the screen was rebuilt. */
+void hc47_hudscale_apply(void)
+{
+    if (g_scale == 1.0f)
+        return;                 /* feature off (lock not initialized) */
+    try_apply();
 }
 
 /* ntdll loader notification: fires on HitmanDlc.dlc load before any of

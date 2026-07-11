@@ -218,7 +218,12 @@ Config (`hc47_tweaks.ini`):
 
 ```ini
 [HudScale]
-Scale=2.0        ; 1.0 disables; fractional values such as 1.5 work
+Scale=2.0        ; 1.0 disables; fractional values such as 1.5 work.
+                 ; An upper bound: the effective scale is clamped per
+                 ; display mode so the virtual GUI size never drops
+                 ; below 640x480, the minimum the game's menu layouts
+                 ; are authored for (2.0 scales by 1.5 at 1280x720,
+                 ; by the full 2.0 from 1280x960 up)
 SharpText=1      ; rasterize TTF fonts at real pixel size
 ```
 

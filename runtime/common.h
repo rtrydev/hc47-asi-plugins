@@ -6,6 +6,7 @@
 
 #include <windows.h>
 #include <stdarg.h>
+#include <stdint.h>
 
 /* scripts directory (no trailing backslash) and the shared log writer;
  * both are set up by DllMain in tweaks.c before any feature init runs.
@@ -32,5 +33,19 @@ void widescreen_init(void);
  * while set and treats a stamp older than ~3s as stale. Defined in
  * widescreen.c. */
 extern volatile DWORD HC47_ModeChangeTick;
+
+/* widescreen -> hudscale: called from the renderer init-OK hooks (after
+ * the handshake is cleared) so the virtual GUI size lands in the layout
+ * fields synchronously, BEFORE the engine's post-mode-change code
+ * re-lays the open screens out against the real mode. No-op while the
+ * HudScale feature is off. Defined in hudscale.c. */
+void hc47_hudscale_apply(void);
+
+/* widescreen -> hudscale: translate an in-game mode request that echoes
+ * a snapshotted virtual GUI size (the options screen's Cancel path)
+ * back to the real mode it stands for. Call only for requests that are
+ * not in the display-mode list. Returns 1 when {w,h} was rewritten.
+ * Defined in hudscale.c. */
+int hc47_hudscale_unvirtual(int32_t *w, int32_t *h);
 
 #endif
