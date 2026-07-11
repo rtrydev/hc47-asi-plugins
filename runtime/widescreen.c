@@ -38,7 +38,9 @@
  *     driver's mode list; a miss throws "Unable to find a suitable
  *     display mode for true color. Try changing to 16bit colors."
  *  2. On modern Windows the legacy D3D7 HAL refuses render targets
- *     larger than 2048px per axis. Wine/CrossOver has no such limit.
+ *     larger than 2048px per axis — windowed and exclusive fullscreen
+ *     alike (verified live: fullscreen 3840x2160 fails CreateDevice
+ *     with D3DERR_INVALID_DEVICE). Wine/CrossOver has no such limit.
  * So before the renderer runs mode selection, the requested resolution
  * in ZSysInterface is validated and clamped to the best resolution that
  * works when a check fails.
@@ -113,10 +115,18 @@
  * stages the request in a separate pending set — mode to si+0x21/+0x25,
  * bpp to +0x2d, fullscreen to si+0x13 — and raises the re-init dirty
  * byte si+0x38ed that the frame loop consumes. So SetResolution is
- * replaced wholesale with a reimplementation that runs the borderless
- * conversion on the staged values first; the mode-change re-init then
- * re-runs the windowed surface setup, which re-applies the window resize
- * and the rect/size overrides automatically.
+ * replaced wholesale with a reimplementation (on every platform): it
+ * runs the borderless conversion on the staged values when borderless
+ * is wanted, detects changes against the CURRENT mode (the stock code
+ * compares the layout fields, which under HudScale hold the virtual
+ * GUI size — making every apply a needless full re-init), records the
+ * pick for the ini writer/options screen, and raises the mode-change
+ * handshake before the dirty byte so HudScale cannot rewrite the
+ * layout fields mid-flight (the re-init would adopt the virtual size
+ * as the display mode). The handshake is released by the renderer's
+ * init-OK hook once the new mode is consumed; the mode-change re-init
+ * re-runs the windowed surface setup, which re-applies the window
+ * resize and the rect/size overrides automatically.
  *
  * The options screen composes with all of this: the resolution list, its
  * "%d x %d" labels and the applied values all come from a static mode
@@ -262,11 +272,19 @@ static const struct renderer_site {
                                 to [obj+0xbdd] on the primary ([obj+0x95d],
                                 clipper-attached); the hook colorfills the
                                 letterbox bars first */
+    uint32_t initok;         /* D3D-environment init success (device and
+                                surfaces exist, mode consumed): releases
+                                the mode-change handshake on every path —
+                                the capture hook only covers the windowed
+                                letterbox one, and exclusive fullscreen
+                                otherwise leaves HudScale waiting out its
+                                3s staleness timeout, past the GUI
+                                relayout. 0 = staleness timeout only */
 } RENDERERS[2] = {
     { "RenderD3D.dll",    0x3a3e1338, 0x4d000, 0x29363, 0x298c0, 0x3d178,
-      0x298d0, 0x35030, 0x2959c, 0x3515c, 0x24ac0, 0x70b7, 0x7770 },
+      0x298d0, 0x35030, 0x2959c, 0x3515c, 0x24ac0, 0x70b7, 0x7770, 0x1f07 },
     { "RenderOpenGL.dll", 0x3a3e1318, 0x56000, 0x2b913, 0x2be70, 0x36d28,
-      0x2be80, 0x2f028, 0, 0, 0, 0, 0 },
+      0x2be80, 0x2f028, 0, 0, 0, 0, 0, 0 },
 };
 
 /* SetResolution after the `mov eax,[glob]` the hook replaces:
@@ -315,6 +333,11 @@ static const uint8_t PRESENT_BYTES[22] = {
 };
 #define PRESENT_HOOK_LEN 9
 
+/* Init-OK tail (rva 0x1f07, just past the failure branch that raises
+ * "Unable to initialize Direct3D"): mov edx,[ebp+0x971] — position-
+ * independent, stolen whole. */
+static const uint8_t INITOK_BYTES[6] = { 0x8b, 0x95, 0x71, 0x09, 0x00, 0x00 };
+
 #define DDBLT_COLORFILL 0x00000400
 #define DDBLT_WAIT      0x01000000
 
@@ -354,6 +377,9 @@ static int g_modern_list = 1;        /* options menu: replace the stock
                                         resolutions */
 static int g_letterbox_ok;           /* the loaded renderer supports the
                                         in-window letterbox (RenderD3D) */
+static int32_t g_setres_limit;       /* windowed render-target axis limit
+                                        for in-game requests (D3D7 HAL on
+                                        real Windows), 0 = none */
 
 static int32_t g_req_w, g_req_h;     /* the resolution the player chose
                                         (before any borderless conversion
@@ -471,6 +497,39 @@ static int desktop_size(int32_t *w, int32_t *h)
     *w = GetSystemMetrics(SM_CXSCREEN);
     *h = GetSystemMetrics(SM_CYSCREEN);
     return *w >= 320 && *h >= 200;
+}
+
+/* Scan the display-mode list for a fullscreen request: reports whether
+ * {w,h} exists verbatim (any listed mode still needs to fit the D3D7
+ * render-target limit on real Windows — exclusive fullscreen fails
+ * CreateDevice above it just like a windowed target) and finds the best
+ * replacement within the limit: prefer the requested aspect, then size.
+ * Returns 0 when no 32bpp mode could be enumerated at all. */
+static int best_fullscreen_mode(int32_t w, int32_t h, int32_t limit,
+                                int32_t *bw, int32_t *bh, int *exact)
+{
+    DEVMODEA dm;
+    memset(&dm, 0, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    int any = 0;
+    *bw = 0;
+    *bh = 0;
+    *exact = 0;
+    for (DWORD i = 0; EnumDisplaySettingsA(NULL, i, &dm); i++) {
+        if (dm.dmBitsPerPel < 32) continue;
+        int32_t mw = (int32_t)dm.dmPelsWidth, mh = (int32_t)dm.dmPelsHeight;
+        any = 1;
+        if (mw == w && mh == h) *exact = 1;
+        if (mw > w || mh > h || mw > limit || mh > limit) continue;
+        int cand_asp = mw * h == mh * w;
+        int best_asp = *bw && *bh && *bw * h == *bh * w;
+        if (cand_asp != best_asp ? cand_asp
+                                 : (int64_t)mw * mh > (int64_t)*bw * *bh) {
+            *bw = mw;
+            *bh = mh;
+        }
+    }
+    return any;
 }
 
 /* Which renderer will the game load? Parsed from hitman.ini in the game
@@ -735,7 +794,15 @@ void __cdecl reinit_entry(uint32_t *regs)
     uint8_t *si = sysiface();
     if (!si)
         return;
-    modechange_begin();
+    /* Raise the handshake only for real re-inits: at startup this site
+     * runs well before HitmanDlc.dlc loads, and HudScale's first apply
+     * (gated on that load, deliberately placed before any GUI layout
+     * runs) must not be pushed past the menu's first layout — a late
+     * first apply renders the already-laid-out GUI scaled off screen.
+     * Before the DLC is loaded HudScale cannot write the fields anyway,
+     * so there is nothing to hold off. */
+    if (GetModuleHandleA("HitmanDlc.dlc"))
+        modechange_begin();
     if (g_borderless_active && g_fit_w >= 320 && g_fit_h >= 200) {
         int32_t w, h;
         memcpy(&w, si + 0x19, 4);
@@ -772,7 +839,6 @@ void __cdecl setres_entry(uint32_t *regs)
         return;
     int32_t w = req[0], h = req[1], bpp = req[2];
     int fs = req[3] != 0;
-    modechange_begin();
     logf_("in-game mode request %dx%d bpp %d %s", w, h, bpp,
           fs ? "fullscreen" : "windowed");
     int32_t dw, dh;
@@ -791,14 +857,40 @@ void __cdecl setres_entry(uint32_t *regs)
         w = tw;
         h = th;
         fs = 0;
-    } else if (!fs) {
-        /* borderless off: a windowed request is honored as-is — window
-         * at its own size, no bars, the plain size is what gets saved */
+    } else {
+        /* borderless off: the request is honored as-is — exclusive
+         * fullscreen or a window at its own size, and the plain values
+         * are what gets saved and re-selected in the options screen.
+         * Except: a render target over the D3D7 HAL limit cannot init
+         * on real Windows, fullscreen and windowed alike — the re-init
+         * would die with a FATAL "Unable to initialize Direct3D" —
+         * so clamp it the same way the startup guard does. */
+        if (g_setres_limit &&
+            (w > g_setres_limit || h > g_setres_limit)) {
+            int32_t cw = 0, ch = 0;
+            if (fs) {
+                int exact;
+                best_fullscreen_mode(w, h, g_setres_limit, &cw, &ch, &exact);
+            } else {
+                double f = (double)g_setres_limit / (w > h ? w : h);
+                cw = ((int32_t)(w * f) + 4) & ~7;
+                ch = ((int32_t)(h * f) + 4) & ~7;
+                if (cw > g_setres_limit) cw = g_setres_limit;
+                if (ch > g_setres_limit) ch = g_setres_limit;
+            }
+            if (cw >= 320 && ch >= 200) {
+                logf_("%s %dx%d exceeds the D3D7 render-target limit — "
+                      "clamped to %dx%d", fs ? "fullscreen" : "windowed",
+                      w, h, cw, ch);
+                w = cw;
+                h = ch;
+            }
+        }
         g_letterbox = 0;
         g_borderless_active = 0;
         g_req_w = w;
         g_req_h = h;
-        g_req_fs = 0;
+        g_req_fs = fs;
     }
     int dirty = 0;
     int32_t cur;
@@ -823,8 +915,14 @@ void __cdecl setres_entry(uint32_t *regs)
      * copies +0x13 to +0x12 unconditionally, so a stale value here
      * would resurrect a long-dead fullscreen request */
     si[0x13] = (uint8_t)fs;
-    if (dirty)
+    if (dirty) {
+        /* raise the handshake only when a re-init will actually run:
+         * a no-change apply never consumes the layout fields, and the
+         * tick would just hold HudScale off for its 3s staleness
+         * window while the apply-settings code rewrites them */
+        modechange_begin();
         si[0x38ed] = 1;
+    }
 }
 
 /* Runs at the single MoveWindow call that sizes the game window (inside
@@ -903,6 +1001,20 @@ void __cdecl capture_entry(uint32_t *regs)
                                             garbage until painted over */
     logf_("present rect -> %d,%d %dx%d, backbuffer/viewport %dx%d",
           g_fit_x, g_fit_y, g_fit_w, g_fit_h, g_fit_w, g_fit_h);
+}
+
+/* Runs when the renderer's D3D-environment init succeeds (exclusive
+ * fullscreen and windowed alike): the staged mode has been fully
+ * consumed and the device exists, so HudScale may reclaim the layout
+ * fields immediately instead of waiting out its staleness timeout —
+ * which would land the virtual GUI size AFTER the mode change relaid
+ * the GUI out, rendering it scaled off screen. The windowed letterbox
+ * path also ends the handshake at the capture hook; ending twice is
+ * harmless. */
+void __cdecl initok_entry(uint32_t *regs)
+{
+    (void)regs;
+    modechange_end();
 }
 
 /* Runs at the per-frame present entry. While letterboxing (windowed,
@@ -1119,9 +1231,11 @@ static int display_mode_exists(int32_t w, int32_t h)
  * possible (not borderless) an entry must exist verbatim in the display
  * mode list or the mode-set dies with the "16bit colors" error, and
  * RenderD3D on real Windows refuses render targets above 2048px per
- * axis. Under borderless everything is a windowed request, and with
- * PreserveAspectRatio any aspect is meaningful (it letterboxes to the
- * largest fit), so nothing is filtered there. */
+ * axis — fullscreen and windowed alike — so offering such an entry is
+ * a fatal-error trap. Under borderless everything is a windowed
+ * request, and with PreserveAspectRatio any aspect is meaningful (it
+ * letterboxes to the largest fit), so only the limit is filtered
+ * there. */
 static void inject_menu_mode(const struct renderer_site *r, uint8_t *base)
 {
     int borderless = borderless_wanted();
@@ -1160,8 +1274,11 @@ static void inject_menu_mode(const struct renderer_site *r, uint8_t *base)
     }
     /* the mode actually running always belongs in the list: the desktop
      * size (what a borderless fullscreen request fills without aspect
-     * preservation) and the startup request (already validated by the
-     * resolution guard) */
+     * preservation) and the startup request. Both must pass the same
+     * filters as the fixed entries: g_req is the PRE-validation ini
+     * request — e.g. 3840x2160 on a system whose D3D7 HAL tops out at
+     * 2048px — and offering it back would let the player apply a mode
+     * whose re-init dies with a fatal error. */
     int32_t rq_w = g_req_w, rq_h = g_req_h;
     if (rq_w < 320 || rq_h < 200) {
         uint8_t *si = sysiface();
@@ -1178,6 +1295,10 @@ static void inject_menu_mode(const struct renderer_site *r, uint8_t *base)
     }
     for (int e = 0; e < 2; e++) {
         if (extra[e][0] < 320 || extra[e][1] < 200 || n >= MENU_MAX)
+            continue;
+        if (extra[e][0] > limit || extra[e][1] > limit)
+            continue;
+        if (!borderless && !display_mode_exists(extra[e][0], extra[e][1]))
             continue;
         int have = 0;
         for (int i = 0; i < n; i++)
@@ -1271,16 +1392,21 @@ static void patch_letterbox(const struct renderer_site *r, uint8_t *base)
     logf_("%s: in-window letterbox armed", r->module);
 }
 
-/* Replace the renderer interface's SetResolution with the converting
- * reimplementation (setres_entry): the 5-byte `mov eax,[glob]` at its
- * entry becomes a jmp to a stub that calls the C function and returns
- * with `ret 4` — the original body is fully reproduced there, so nothing
- * jumps back. Without this hook an in-game options apply stages a raw
- * exclusive-fullscreen request that no other patch point can intercept. */
+/* Replace the renderer interface's SetResolution with the reimplementation
+ * (setres_entry): the 5-byte `mov eax,[glob]` at its entry becomes a jmp
+ * to a stub that calls the C function and returns with `ret 4` — the
+ * original body is fully reproduced there, so nothing jumps back.
+ * Installed on every platform, not just for the borderless conversion:
+ * the stock staging compares the request against the LAYOUT fields
+ * (+0x19/+0x1d) — under HudScale those hold the virtual GUI size, so
+ * every options apply (even a sound-only change) looks like a mode
+ * change and forces a needless full re-init — and it raises the dirty
+ * byte without the mode-change handshake, leaving the staged request
+ * exposed to a HudScale rewrite that the re-init would adopt as the
+ * display mode. The hook also records the pick for the hitman.ini
+ * writer and the options screen. */
 static void patch_setres(const struct renderer_site *r, uint8_t *base)
 {
-    if (!borderless_wanted())
-        return;                    /* stock staging is fine as-is */
     uint8_t *site = base + r->setres;
     uint32_t glob = (uint32_t)(uintptr_t)(base + r->setres_glob);
     if (site[0] != 0xa1 || memcmp(site + 1, &glob, 4) != 0 ||
@@ -1291,13 +1417,16 @@ static void patch_setres(const struct renderer_site *r, uint8_t *base)
     }
     if (!ensure_stubs() || !sysiface())
         return;
+    g_setres_limit = (r == &RENDERERS[0] && !is_wine()) ? D3D7_MAX_RT_AXIS
+                                                        : 0;
     uint8_t *stub = g_stub_p;
     uint8_t *p = emit_hook_call(stub, (void *)setres_entry);
     *p++ = 0xC2; *p++ = 0x04; *p++ = 0x00;      /* ret 4 */
     g_stub_p = p;
     if (hook_site(site, 5, stub))
-        logf_("%s: in-game mode requests routed through the borderless "
-              "conversion", r->module);
+        logf_("%s: in-game mode requests hooked (staging, handshake, "
+              "persistence%s)", r->module,
+              borderless_wanted() ? ", borderless conversion" : "");
 }
 
 /* Wrap the hitman.ini writer (see iniwrite_wrap): verify EngineData and
@@ -1392,6 +1521,11 @@ static int patch_renderer_snap(int *which)
         inject_menu_mode(&RENDERERS[i], (uint8_t *)m);
         patch_letterbox(&RENDERERS[i], (uint8_t *)m);
         patch_setres(&RENDERERS[i], (uint8_t *)m);
+        if (RENDERERS[i].initok)
+            hook_with_replay("renderer init-OK (handshake release)",
+                             (uint8_t *)m + RENDERERS[i].initok,
+                             INITOK_BYTES, sizeof(INITOK_BYTES),
+                             sizeof(INITOK_BYTES), (void *)initok_entry);
         /* the letterbox hooks did not all land (or OpenGL): fall back to
          * filling the desktop so the image is never sheared */
         if (g_preserve_aspect && borderless_wanted() && !g_letterbox_ok) {
@@ -1455,24 +1589,14 @@ static int guard_resolution(uint8_t *si)
     int32_t bw = 0, bh = 0;               /* best replacement */
 
     if (fullscreen) {
-        /* the mode list the renderer will match against */
-        DEVMODEA dm;
-        memset(&dm, 0, sizeof(dm));
-        dm.dmSize = sizeof(dm);
+        /* the mode list the renderer will match against; the D3D7 HAL
+         * limit applies here too (verified live: exclusive fullscreen
+         * 3840x2160 fails CreateDevice with D3DERR_INVALID_DEVICE just
+         * like a windowed target) */
         int exact = 0;
-        for (DWORD i = 0; EnumDisplaySettingsA(NULL, i, &dm); i++) {
-            if (dm.dmBitsPerPel < 32) continue;
-            int32_t mw = (int32_t)dm.dmPelsWidth, mh = (int32_t)dm.dmPelsHeight;
-            if (mw == w && mh == h) exact = 1;
-            /* candidate ranking: within the limit, prefer the requested
-             * aspect, then size */
-            if (mw > w || mh > h || mw > limit || mh > limit) continue;
-            int cand_asp = mw * h == mh * w;
-            int best_asp = bw && bh && bw * h == bh * w;
-            if (cand_asp != best_asp ? cand_asp
-                                     : (int64_t)mw * mh > (int64_t)bw * bh) {
-                bw = mw; bh = mh;
-            }
+        if (!best_fullscreen_mode(w, h, limit, &bw, &bh, &exact)) {
+            logf_("no display modes enumerable — leaving %dx%d", w, h);
+            return 1;
         }
         if (exact && w <= limit && h <= limit)
             return 1;                     /* request is fine as-is */
