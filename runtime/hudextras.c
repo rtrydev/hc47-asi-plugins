@@ -1,4 +1,5 @@
-/* HC47 HUD Extras — crosshair shrink + mission timer + FPS overlay (32-bit ASI).
+/* HudExtras feature of hc47_tweaks.asi — crosshair shrink + mission
+ * timer + FPS overlay for Hitman: Codename 47.
  *
  * Three independent features, all driven from a single per-frame hook on the
  * engine's game-tick call site (System.dll), so every engine call we make
@@ -27,7 +28,7 @@
  * Timer and FPS are rendered below the top-left HUD with the game's own
  * HUD text pipeline (see hudtext section below).
  *
- * Config: scripts/HC47HudExtras.ini
+ * Config (hc47_tweaks.ini):
  *   [HudExtras]
  *   CrosshairScale=0.5   ; 1.0 = untouched
  *   ShowTimer=1
@@ -45,6 +46,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+
+#include "common.h"
 
 /* ---- build identity ---- */
 #define DLC_TIMESTAMP    0x3a3e13d1
@@ -79,8 +82,6 @@ static const uint8_t DLC_LCINIT_BYTES[5] = { 0x8B, 0x44, 0x24, 0x04, 0x53 };
 /* first insn is `mov eax,[VA_GAMEPTR]` — absolute address, so the expected
  * bytes are built at runtime with the relocation delta applied */
 
-static FILE *g_log;
-static char g_dir[MAX_PATH];
 static float g_xhair = 1.0f;
 static int g_show_timer = 1, g_show_fps = 1;
 static float g_text_x = 10.0f, g_text_y = 100.0f, g_line_gap = 16.0f;
@@ -95,19 +96,16 @@ static double g_mission_start;
 
 static void logf_(const char *fmt, ...)
 {
-    if (!g_log) return;
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
+    hc47_vlog("hudextras", fmt, ap);
     va_end(ap);
-    fputc('\n', g_log);
-    fflush(g_log);
 }
 
 static void read_ini(void)
 {
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\HC47HudExtras.ini", g_dir);
+    snprintf(path, sizeof(path), "%s\\%s", hc47_dir, HC47_INI);
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[128];
@@ -1152,21 +1150,10 @@ static DWORD WINAPI init_thread(LPVOID arg)
     return 0;
 }
 
-BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+void hudextras_init(void)
 {
-    (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(inst);
-        GetModuleFileNameA(inst, g_dir, sizeof(g_dir));
-        char *sl = strrchr(g_dir, '\\');
-        if (sl) *sl = 0;
-        char logpath[MAX_PATH];
-        snprintf(logpath, sizeof(logpath), "%s\\HC47HudExtras.log", g_dir);
-        g_log = fopen(logpath, "w");
-        read_ini();
-        logf_("HC47 HUD Extras loaded: CrosshairScale=%.3f ShowTimer=%d ShowFPS=%d",
-              (double)g_xhair, g_show_timer, g_show_fps);
-        CreateThread(NULL, 0, init_thread, NULL, 0, NULL);
-    }
-    return TRUE;
+    read_ini();
+    logf_("CrosshairScale=%.3f ShowTimer=%d ShowFPS=%d",
+          (double)g_xhair, g_show_timer, g_show_fps);
+    CreateThread(NULL, 0, init_thread, NULL, 0, NULL);
 }

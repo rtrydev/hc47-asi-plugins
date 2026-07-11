@@ -5,7 +5,7 @@
  * handler. Used to pinpoint why windowed mode dies at desktop-sized
  * resolutions on modern Windows.
  *
- * Output: scripts/HC47WinModeDiag.log
+ * Output: scripts/hc47_win_mode_diag.log
  */
 #include <windows.h>
 #include <stdio.h>
@@ -156,7 +156,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         GetModuleFileNameA(inst, path, sizeof(path));
         char *sl = strrchr(path, '\\');
         if (sl) *sl = 0;
-        strncat(path, "\\HC47WinModeDiag.log", sizeof(path) - strlen(path) - 1);
+        strncat(path, "\\hc47_win_mode_diag.log", sizeof(path) - strlen(path) - 1);
         g_log = fopen(path, "w");
         logf_("HC47 window-mode diag loaded");
         AddVectoredExceptionHandler(1, on_exception);

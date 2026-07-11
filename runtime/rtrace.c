@@ -6,7 +6,7 @@
  * (resolved to module+rva), `this`, and the first stack args — enough to
  * identify the 2D/HUD draw path and who calls it.
  *
- * Output: scripts/HC47RenderTrace.log
+ * Output: scripts/hc47_render_trace.log
  */
 #include <windows.h>
 #include <tlhelp32.h>
@@ -282,7 +282,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         GetModuleFileNameA(inst, path, sizeof(path));
         char *sl = strrchr(path, '\\');
         if (sl) *sl = 0;
-        strncat(path, "\\HC47RenderTrace.log", sizeof(path) - strlen(path) - 1);
+        strncat(path, "\\hc47_render_trace.log", sizeof(path) - strlen(path) - 1);
         g_log = fopen(path, "w");
         logf_("HC47 render tracer loaded");
         CreateThread(NULL, 0, wait_thread, NULL, 0, NULL);

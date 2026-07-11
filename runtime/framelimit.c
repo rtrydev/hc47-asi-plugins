@@ -1,5 +1,5 @@
-/* HC47 FrameLimit — configurable FPS cap for Hitman: Codename 47
- * (32-bit ASI).
+/* FrameLimit feature of hc47_tweaks.asi — configurable FPS cap for
+ * Hitman: Codename 47.
  *
  * The engine has no frame limiter of its own: the per-frame game-time
  * latch in System.dll (function 0xe2e0) copies current->previous time and
@@ -8,7 +8,7 @@
  * limiter steps in, and high frame rates are known to cause gameplay and
  * camera bugs in this engine.
  *
- * This plugin hooks the latch's clock call site (`call [edx+0xb4]` at
+ * This feature hooks the latch's clock call site (`call [edx+0xb4]` at
  * System.dll+0xe309, byte-checked against the retail build) and stalls
  * each frame until the configured frame period has elapsed, measured
  * with QueryPerformanceCounter. The wait sleeps in 1 ms steps while more
@@ -16,9 +16,9 @@
  * without burning a whole core. Pacing happens before the engine samples
  * its clock, so the measured frame delta stays clean at the cap.
  *
- * The call site (not the function entry) is hooked deliberately:
- * HC47HudExtras entry-hooks the same latch function at +0xe2e0 for its
- * frame tick, and the two patches must not overlap. The engine's
+ * The call site (not the function entry) is hooked deliberately: the
+ * hudextras feature entry-hooks the same latch function at +0xe2e0 for
+ * its frame tick, and the two patches must not overlap. The engine's
  * fixed-step benchmark branch bypasses the clock call and therefore the
  * cap, which is the sensible behavior there.
  *
@@ -26,7 +26,7 @@
  * falls more than one period behind (loading, hitches), the deadline
  * resyncs instead of fast-forwarding through queued frames.
  *
- * Config: scripts/HC47FrameLimit.ini
+ * Config (hc47_tweaks.ini):
  *   [FrameLimit]
  *   FpsCap=60        ; frames per second; 0 disables the cap
  */
@@ -35,15 +35,15 @@
 #include <stdint.h>
 #include <string.h>
 
-/* System.dll, retail build (same stamp check as HC47HudExtras) */
+#include "common.h"
+
+/* System.dll, retail build (same stamp check as hudextras.c) */
 #define SYS_TIMESTAMP    0x3a3e130a
 #define SYS_SIZEOFIMAGE  0x47000
 #define CLOCKCALL_RVA    0xe309
 /* call [edx+0xb4] — the latch's per-frame clock read */
 static const uint8_t CLOCKCALL_BYTES[6] = { 0xff, 0x92, 0xb4, 0x00, 0x00, 0x00 };
 
-static FILE *g_log;
-static char g_dir[MAX_PATH];
 static float g_fpscap = 60.0f;
 
 static LARGE_INTEGER g_freq;
@@ -52,19 +52,16 @@ static LONGLONG g_deadline;
 
 static void logf_(const char *fmt, ...)
 {
-    if (!g_log) return;
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
+    hc47_vlog("framelimit", fmt, ap);
     va_end(ap);
-    fputc('\n', g_log);
-    fflush(g_log);
 }
 
 static void read_config(void)
 {
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\HC47FrameLimit.ini", g_dir);
+    snprintf(path, sizeof(path), "%s\\%s", hc47_dir, HC47_INI);
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[128];
@@ -161,25 +158,14 @@ static DWORD WINAPI watch_thread(LPVOID arg)
     return 0;
 }
 
-BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+void framelimit_init(void)
 {
-    (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(inst);
-        GetModuleFileNameA(inst, g_dir, sizeof(g_dir));
-        char *sl = strrchr(g_dir, '\\');
-        if (sl) *sl = 0;
-        char logpath[MAX_PATH];
-        snprintf(logpath, sizeof(logpath), "%s\\HC47FrameLimit.log", g_dir);
-        g_log = fopen(logpath, "w");
-        read_config();
-        QueryPerformanceFrequency(&g_freq);
-        if (g_fpscap > 0.0f && g_freq.QuadPart > 0)
-            g_period = (LONGLONG)((double)g_freq.QuadPart / (double)g_fpscap);
-        logf_("HC47 FrameLimit loaded, FpsCap=%.1f%s", (double)g_fpscap,
-              g_period ? "" : " (disabled)");
-        if (g_period)
-            CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
-    }
-    return TRUE;
+    read_config();
+    QueryPerformanceFrequency(&g_freq);
+    if (g_fpscap > 0.0f && g_freq.QuadPart > 0)
+        g_period = (LONGLONG)((double)g_freq.QuadPart / (double)g_fpscap);
+    logf_("FpsCap=%.1f%s", (double)g_fpscap,
+          g_period ? "" : " (disabled)");
+    if (g_period)
+        CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
 }

@@ -10,7 +10,7 @@
  *    DLL override "dsound=native,builtin" for the bottle (already the
  *    case for any setup where an ASI loader ever worked).
  *  - On process attach it loads every *.asi from the scripts/ directory
- *    next to it, and logs to scripts/HC47AsiLoader.log.
+ *    next to it, and logs to scripts/hc47_asi_loader.log.
  *  - All 12 documented dsound.dll exports are provided at their real
  *    ordinals (see dsound.def) and forwarded to the system dsound.dll,
  *    resolved lazily on first call. Getting the ordinals right matters:
@@ -149,7 +149,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         char *sl = strrchr(g_dir, '\\');
         if (sl) *sl = 0;
         char logpath[MAX_PATH];
-        snprintf(logpath, sizeof(logpath), "%s\\scripts\\HC47AsiLoader.log",
+        snprintf(logpath, sizeof(logpath), "%s\\scripts\\hc47_asi_loader.log",
                  g_dir);
         g_log = fopen(logpath, "w");
         logf_("HC47 ASI Loader (dsound.dll proxy) attached");

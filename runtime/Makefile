@@ -11,60 +11,51 @@ LDFLAGS := -shared -Wl,--kill-at -static -lkernel32
 
 .PHONY: all clean rtrace prof wmdiag
 
-all: ../dist/HC47ReducedX87.asi ../dist/HC47ReducedX87-diag.asi ../dist/HC47HudScale.asi ../dist/HC47HudExtras.asi ../dist/HC47Widescreen.asi ../dist/HC47FrameLimit.asi ../dist/dsound.dll
+all: ../dist/hc47_reduced_x87.asi ../dist/hc47_reduced_x87_diag.asi ../dist/hc47_tweaks.asi ../dist/dsound.dll
 
-../dist/HC47HudScale.asi: hudscale.c
-	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+# the combined gameplay/graphics plugin: widescreen + hudscale +
+# hudextras + framelimit in one ASI (see tweaks.c for why they merge)
+TWEAKS_SRC := tweaks.c widescreen.c hudscale.c hudextras.c framelimit.c
 
-../dist/HC47HudExtras.asi: hudextras.c
+../dist/hc47_tweaks.asi: $(TWEAKS_SRC) common.h
 	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-../dist/HC47Widescreen.asi: widescreen.c
-	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-../dist/HC47FrameLimit.asi: framelimit.c
-	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(TWEAKS_SRC) $(LDFLAGS)
 
 ../dist/dsound.dll: asiloader.c dsound.def
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -Wl,--enable-stdcall-fixup
 
 # diagnostic window-mode/D3D-init prober (not part of `all`)
-wmdiag: ../dist/HC47WinModeDiag.asi
+wmdiag: ../dist/hc47_win_mode_diag.asi
 
-../dist/HC47WinModeDiag.asi: wmdiag.c
+../dist/hc47_win_mode_diag.asi: wmdiag.c
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # diagnostic render-interface tracer (not part of `all`)
-rtrace: ../dist/HC47RenderTrace.asi
+rtrace: ../dist/hc47_render_trace.asi
 
-../dist/HC47RenderTrace.asi: rtrace.c
+../dist/hc47_render_trace.asi: rtrace.c
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # diagnostic EIP-sampling profiler (not part of `all`)
-prof: ../dist/HC47Profile.asi
+prof: ../dist/hc47_profile.asi
 
-../dist/HC47Profile.asi: eipprof.c
+../dist/hc47_profile.asi: eipprof.c
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-../dist/HC47ReducedX87.asi: hc47x87.c helpers.S
+../dist/hc47_reduced_x87.asi: hc47x87.c helpers.S
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-../dist/HC47ReducedX87-diag.asi: hc47x87.c helpers.S
+../dist/hc47_reduced_x87_diag.asi: hc47x87.c helpers.S
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -DHC47_DIAG -o $@ $^ $(LDFLAGS)
 
 clean:
-	rm -f ../dist/HC47ReducedX87.asi ../dist/HC47ReducedX87-diag.asi \
-	      ../dist/HC47HudScale.asi ../dist/HC47HudExtras.asi \
-	      ../dist/HC47Widescreen.asi ../dist/HC47FrameLimit.asi \
-	      ../dist/dsound.dll ../dist/HC47WinModeDiag.asi \
-	      ../dist/HC47RenderTrace.asi ../dist/HC47Profile.asi
+	rm -f ../dist/hc47_reduced_x87.asi ../dist/hc47_reduced_x87_diag.asi \
+	      ../dist/hc47_tweaks.asi \
+	      ../dist/dsound.dll ../dist/hc47_win_mode_diag.asi \
+	      ../dist/hc47_render_trace.asi ../dist/hc47_profile.asi

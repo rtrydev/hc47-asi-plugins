@@ -1,4 +1,5 @@
-/* HC47 HUD Scale — native GUI scaling for Hitman: Codename 47 (32-bit ASI).
+/* HudScale feature of hc47_tweaks.asi — native GUI scaling for
+ * Hitman: Codename 47.
  *
  * The engine's GUI (menus, HUD, text) lays itself out in pixels against the
  * resolution stored in ZSysInterface (+0x19 width, +0x1d height, packed
@@ -16,7 +17,7 @@
  * window mode (exclusive fullscreen / borderless / windowed) are untouched,
  * unlike the dgVoodoo resolution-forcing trick this replaces.
  *
- * Config: scripts/HC47HudScale.ini
+ * Config (hc47_tweaks.ini):
  *   [HudScale]
  *   Scale=2.0        ; 1.0 = off; fractional values fine (e.g. 1.5)
  *   SharpText=1      ; re-rasterize TTF fonts at the real pixel size
@@ -58,6 +59,8 @@
 #include <string.h>
 #include <math.h>
 
+#include "common.h"
+
 /* ZSysInterface field offsets (packed struct, verified against System.dll
  * config parser, RenderD3D mode-set and HitmanDlc consumers of this build:
  * HitmanDlc.dlc TimeDateStamp 3A44AFAF era, System.dll 3a3e...) */
@@ -78,27 +81,22 @@ static const uint8_t TTF_SIZE_BYTES[6] = { 0x8b, 0x8e, 0x6c, 0x02, 0x00, 0x00 };
 #define LABEL_FONT_OFF   0x10b     /* label -> font-ish object (charset?) */
 #define LABEL_FONT2_OFF  0x20f     /* label -> glyph provider (GetGlyph target) */
 
-static FILE *g_log;
 static float g_scale = 1.0f;
 static int g_sharptext = 1;
-static char g_dir[MAX_PATH];
 static double g_invscale = 1.0;    /* referenced from the stub */
 
 static void logf_(const char *fmt, ...)
 {
-    if (!g_log) return;
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
+    hc47_vlog("hudscale", fmt, ap);
     va_end(ap);
-    fputc('\n', g_log);
-    fflush(g_log);
 }
 
 static float read_scale(void)
 {
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\HC47HudScale.ini", g_dir);
+    snprintf(path, sizeof(path), "%s\\%s", hc47_dir, HC47_INI);
     FILE *f = fopen(path, "r");
     if (!f) return 1.0f;
     float scale = 1.0f;
@@ -283,26 +281,16 @@ static int g_applied;
 static int32_t g_vw, g_vh;          /* virtual size we maintain */
 static int32_t g_realw, g_realh;    /* last seen real mode */
 
-/* HC47Widescreen handshake: its exported HC47_ModeChangeTick holds a
+/* Widescreen handshake: HC47_ModeChangeTick (widescreen.c) holds a
  * GetTickCount stamp while an in-game mode change is staged/consumed.
  * The renderer re-init reads +0x19/+0x1d back as the DISPLAY MODE in
  * that window — re-applying the virtual size then makes the game come
  * up in a mode of the virtual size (GUI ends up at scale² too small).
  * A stamp older than 3s is treated as stale (renderer paths without
  * the end-of-consumption hook), so a missed clear cannot wedge us. */
-static volatile DWORD *g_ws_tick;
-
 static int modechange_inflight(void)
 {
-    if (!g_ws_tick) {
-        HMODULE m = GetModuleHandleA("HC47Widescreen.asi");
-        if (m)
-            g_ws_tick = (volatile DWORD *)(uintptr_t)
-                GetProcAddress(m, "HC47_ModeChangeTick");
-        if (!g_ws_tick)
-            return 0;
-    }
-    DWORD t = *g_ws_tick;
+    DWORD t = HC47_ModeChangeTick;
     return t != 0 && GetTickCount() - t < 3000;
 }
 
@@ -372,30 +360,19 @@ static DWORD WINAPI watch_thread(LPVOID arg)
     return 0;
 }
 
-BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+void hudscale_init(void)
 {
-    (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(inst);
-        GetModuleFileNameA(inst, g_dir, sizeof(g_dir));
-        char *sl = strrchr(g_dir, '\\');
-        if (sl) *sl = 0;
-        char logpath[MAX_PATH];
-        snprintf(logpath, sizeof(logpath), "%s\\HC47HudScale.log", g_dir);
-        g_log = fopen(logpath, "w");
-        g_scale = read_scale();
-        logf_("HC47 HUD Scale loaded, Scale=%.3f%s", (double)g_scale,
-              g_scale == 1.0f ? " (disabled)" : "");
-        if (g_scale != 1.0f) {
-            InitializeCriticalSection(&g_applylock);
-            LdrRegisterDllNotification_t reg = (LdrRegisterDllNotification_t)
-                (uintptr_t)GetProcAddress(GetModuleHandleA("ntdll.dll"),
-                                          "LdrRegisterDllNotification");
-            void *cookie = NULL;
-            if (reg && reg(0, on_dll_notify, NULL, &cookie) == 0)
-                logf_("using loader notifications for first apply");
-            CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
-        }
+    g_scale = read_scale();
+    logf_("Scale=%.3f%s", (double)g_scale,
+          g_scale == 1.0f ? " (disabled)" : "");
+    if (g_scale != 1.0f) {
+        InitializeCriticalSection(&g_applylock);
+        LdrRegisterDllNotification_t reg = (LdrRegisterDllNotification_t)
+            (uintptr_t)GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                      "LdrRegisterDllNotification");
+        void *cookie = NULL;
+        if (reg && reg(0, on_dll_notify, NULL, &cookie) == 0)
+            logf_("using loader notifications for first apply");
+        CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
     }
-    return TRUE;
 }

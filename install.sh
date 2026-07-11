@@ -11,69 +11,99 @@ esac
 GAME="${HC47_GAME_DIR:-$DEFAULT_GAME}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+# Artifacts of the pre-snake_case layouts: the four pre-merge ASIs (now
+# folded into hc47_tweaks.asi) and the CamelCase names of the current
+# plugins. Always removed so a stale copy cannot double-patch alongside
+# the current plugins (the loader picks up every *.asi in scripts/).
+remove_legacy() {
+    for p in HudScale HudExtras Widescreen FrameLimit Tweaks ReducedX87; do
+        rm -f "$GAME/scripts/HC47$p.asi" "$GAME/scripts/HC47$p.log"
+    done
+    rm -rf "$GAME/scripts/HC47ReducedX87"
+    rm -f "$GAME/scripts/HC47AsiLoader.log"
+}
+
 if [ "$1" = "-u" ]; then
     rm -f "$GAME/dsound.dll"
-    rm -f "$GAME/scripts/HC47AsiLoader.log"
-    rm -f "$GAME/scripts/HC47ReducedX87.asi"
-    rm -rf "$GAME/scripts/HC47ReducedX87"
-    rm -f "$GAME/scripts/HC47ReducedX87.log"
-    rm -f "$GAME/scripts/HC47HudScale.asi"
-    rm -f "$GAME/scripts/HC47HudScale.log"
-    rm -f "$GAME/scripts/HC47HudExtras.asi"
-    rm -f "$GAME/scripts/HC47HudExtras.log"
-    rm -f "$GAME/scripts/HC47Widescreen.asi"
-    rm -f "$GAME/scripts/HC47Widescreen.log"
-    rm -f "$GAME/scripts/HC47FrameLimit.asi"
-    rm -f "$GAME/scripts/HC47FrameLimit.log"
+    rm -f "$GAME/scripts/hc47_asi_loader.log"
+    rm -f "$GAME/scripts/hc47_reduced_x87.asi"
+    rm -rf "$GAME/scripts/hc47_reduced_x87"
+    rm -f "$GAME/scripts/hc47_reduced_x87.log"
+    rm -f "$GAME/scripts/hc47_tweaks.asi"
+    rm -f "$GAME/scripts/hc47_tweaks.log"
+    remove_legacy
     # the plugins' .ini files are user config; left in place on purpose
     echo "uninstalled"
     exit 0
 fi
 
-[ -f "$HERE/dist/HC47ReducedX87.asi" ] || { echo "build first: (cd runtime && make)"; exit 1; }
+[ -f "$HERE/dist/hc47_reduced_x87.asi" ] || { echo "build first: (cd runtime && make)"; exit 1; }
 [ -f "$HERE/dist/HitmanDlc.dlc.x87" ] || { echo "generate first: python3 tools/translate.py HitmanDlc.dlc"; exit 1; }
 
-mkdir -p "$GAME/scripts/HC47ReducedX87"
-cp "$HERE/dist/HC47ReducedX87.asi" "$GAME/scripts/"
-cp "$HERE"/dist/*.x87 "$GAME/scripts/HC47ReducedX87/"
+remove_legacy
 
-# HUD scale (independent of the x87 patch; works in any window mode)
-if [ -f "$HERE/dist/HC47HudScale.asi" ]; then
-    cp "$HERE/dist/HC47HudScale.asi" "$GAME/scripts/"
-    if [ ! -f "$GAME/scripts/HC47HudScale.ini" ]; then
-        printf '[HudScale]\nScale=2.0\n' > "$GAME/scripts/HC47HudScale.ini"
+mkdir -p "$GAME/scripts/hc47_reduced_x87"
+cp "$HERE/dist/hc47_reduced_x87.asi" "$GAME/scripts/"
+cp "$HERE"/dist/*.x87 "$GAME/scripts/hc47_reduced_x87/"
+
+# Combined tweaks plugin: widescreen + HUD scale + HUD extras + frame limit
+if [ -f "$HERE/dist/hc47_tweaks.asi" ]; then
+    cp "$HERE/dist/hc47_tweaks.asi" "$GAME/scripts/"
+    if [ ! -f "$GAME/scripts/hc47_tweaks.ini" ]; then
+        # migrate the config of the previous layouts when present: the
+        # CamelCase combined ini, else the per-plugin inis (each already
+        # carries its [Section] header); sections and keys are unchanged
+        migrated=0
+        if [ -f "$GAME/scripts/HC47Tweaks.ini" ]; then
+            mv "$GAME/scripts/HC47Tweaks.ini" "$GAME/scripts/hc47_tweaks.ini"
+            migrated=1
+        else
+            for p in Widescreen HudScale HudExtras FrameLimit; do
+                if [ -f "$GAME/scripts/HC47$p.ini" ]; then
+                    cat "$GAME/scripts/HC47$p.ini" >> "$GAME/scripts/hc47_tweaks.ini"
+                    printf '\n' >> "$GAME/scripts/hc47_tweaks.ini"
+                    migrated=1
+                fi
+            done
+        fi
+        if [ "$migrated" = 1 ]; then
+            echo "migrated existing plugin config into scripts/hc47_tweaks.ini"
+        else
+            cat > "$GAME/scripts/hc47_tweaks.ini" <<'EOF'
+[Widescreen]
+Enabled=1
+FOVFactor=1.0
+DrawDistanceFactor=1.0
+Borderless=-1
+PreserveAspectRatio=1
+ModernResolutionList=1
+
+[HudScale]
+Scale=2.0
+SharpText=1
+
+[HudExtras]
+CrosshairScale=0.5
+ShowTimer=1
+ShowFPS=1
+TextX=10
+TextY=100
+LineGap=16
+
+[FrameLimit]
+FpsCap=60
+EOF
+        fi
     fi
 fi
 
-# HUD extras: crosshair shrink + mission timer + FPS overlay
-if [ -f "$HERE/dist/HC47HudExtras.asi" ]; then
-    cp "$HERE/dist/HC47HudExtras.asi" "$GAME/scripts/"
-    if [ ! -f "$GAME/scripts/HC47HudExtras.ini" ]; then
-        printf '[HudExtras]\nCrosshairScale=0.5\nShowTimer=1\nShowFPS=1\nTextX=10\nTextY=100\nLineGap=16\n' > "$GAME/scripts/HC47HudExtras.ini"
-    fi
-fi
-
-# Widescreen: resolution passthrough + aspect-correct FOV
-if [ -f "$HERE/dist/HC47Widescreen.asi" ]; then
-    cp "$HERE/dist/HC47Widescreen.asi" "$GAME/scripts/"
-    if [ ! -f "$GAME/scripts/HC47Widescreen.ini" ]; then
-        printf '[Widescreen]\nEnabled=1\nFOVFactor=1.0\nDrawDistanceFactor=1.0\nBorderless=-1\nPreserveAspectRatio=1\nModernResolutionList=1\n' > "$GAME/scripts/HC47Widescreen.ini"
-    fi
-fi
-
-# ASI loader: dsound.dll proxy in the game root
+# ASI loader: dsound.dll proxy in the game root (the name is load-bearing
+# — the game's sound stack imports dsound by ordinal — so it is exempt
+# from the snake_case artifact naming)
 if [ -f "$HERE/dist/dsound.dll" ]; then
     cp "$HERE/dist/dsound.dll" "$GAME/dsound.dll"
 fi
 
-# Frame limiter: configurable FPS cap
-if [ -f "$HERE/dist/HC47FrameLimit.asi" ]; then
-    cp "$HERE/dist/HC47FrameLimit.asi" "$GAME/scripts/"
-    if [ ! -f "$GAME/scripts/HC47FrameLimit.ini" ]; then
-        printf '[FrameLimit]\nFpsCap=60\n' > "$GAME/scripts/HC47FrameLimit.ini"
-    fi
-fi
-
 echo "installed to $GAME/scripts"
-echo "log will appear at: $GAME/scripts/HC47ReducedX87.log"
-echo "HUD scale config: $GAME/scripts/HC47HudScale.ini (Scale=1.0 disables)"
+echo "logs will appear at: $GAME/scripts/hc47_reduced_x87.log and hc47_tweaks.log"
+echo "tweaks config: $GAME/scripts/hc47_tweaks.ini"

@@ -3,22 +3,25 @@
 ASI plugins and supporting tools for **Hitman: Codename 47** on modern
 systems, especially CrossOver/Rosetta 2 on Apple Silicon Macs.
 
-The repo currently builds five independent runtime plugins:
+The repo builds two runtime plugins:
 
-- `HC47ReducedX87.asi` — translates safe x87-heavy engine functions to SSE2
+- `hc47_reduced_x87.asi` — translates safe x87-heavy engine functions to SSE2
   double-precision code at runtime to improve CrossOver/Rosetta performance.
-- `HC47HudScale.asi` — scales the game's 2D GUI/HUD layer natively in any
-  window mode, with optional sharper TrueType text.
-- `HC47HudExtras.asi` — adds HUD quality-of-life features: smaller crosshair
-  dot, mission timer, and FPS readout.
-- `HC47Widescreen.asi` — native widescreen support: arbitrary hitman.ini
-  resolutions and aspect-correct FOV.
-- `HC47FrameLimit.asi` — configurable FPS cap (the engine has none of its
-  own, and high frame rates cause gameplay and camera bugs).
+- `hc47_tweaks.asi` — the gameplay/graphics tweaks, four features in one
+  plugin (they are closely coupled — see the Tweaks section):
+  - **Widescreen** — native widescreen support: arbitrary hitman.ini
+    resolutions and aspect-correct FOV.
+  - **HUD Scale** — scales the game's 2D GUI/HUD layer natively in any
+    window mode, with optional sharper TrueType text.
+  - **HUD Extras** — HUD quality-of-life features: smaller crosshair
+    dot, mission timer, and FPS readout.
+  - **Frame Limit** — configurable FPS cap (the engine has none of its
+    own, and high frame rates cause gameplay and camera bugs).
 
-The plugins can be used together or individually. They are byte-checked
-against the supported retail game build; a mismatch disables the affected
-patch path rather than blindly patching unknown code.
+The two plugins can be used together or individually, and every Tweaks
+feature can be disabled in its config section. All patch sites are
+byte-checked against the supported retail game build; a mismatch disables
+the affected patch path rather than blindly patching unknown code.
 
 ## Build & Install
 
@@ -79,7 +82,7 @@ depends on the platform:
 On modern Windows the legacy Direct3D 7 HAL (emulated by `ddraw.dll`)
 refuses render targets larger than 2048px per axis, in windowed and
 fullscreen mode alike — the stock game dies with "Unable to initialize
-Direct3D". The Widescreen plugin detects this (real Windows only, never
+Direct3D". The Widescreen feature of `hc47_tweaks.asi` detects this (real Windows only, never
 under Wine) and clamps the requested resolution to the best fitting
 display mode (fullscreen) or window size (windowed) so the game always
 starts; for native 4K on Windows switch `DrawDll` to `RenderOpenGL.dll`.
@@ -88,11 +91,11 @@ Fullscreen additionally requires the exact `hitman.ini` resolution to
 exist in the driver's display-mode list; a miss makes the stock game die
 with "Unable to find a suitable display mode for true color. Try
 changing to 16bit colors." (common under CrossOver, whose mode list
-rarely contains the exact requested resolution). The Widescreen plugin
+rarely contains the exact requested resolution). The Widescreen feature
 validates the resolution against the mode list before the renderer
 starts and falls back to the closest available mode.
 
-## Plugin: Reduced x87 (`HC47ReducedX87.asi`)
+## Plugin: Reduced x87 (`hc47_reduced_x87.asi`)
 
 This plugin improves performance under CrossOver/Rosetta 2, where x87
 instructions are emulated in software while SSE2 runs much closer to native
@@ -111,21 +114,21 @@ Key pieces:
   state, including x87 stack depth.
 - `tools/translate.py` emits `.x87` patch blobs plus fixups, validated against
   PE timestamp and image size.
-- `runtime/hc47x87.c` loads `.x87` files from `scripts/HC47ReducedX87/`,
+- `runtime/hc47x87.c` loads `.x87` files from `scripts/hc47_reduced_x87/`,
   allocates translated code, applies fixups, and hooks original functions.
 - `tests/` contains the differential tester used to compare original and
   translated leaf functions under Wine/CrossOver.
 
 Install output:
 
-- ASI: `scripts/HC47ReducedX87.asi`
-- Patch blobs: `scripts/HC47ReducedX87/*.x87`
-- Log: `scripts/HC47ReducedX87.log`
+- ASI: `scripts/hc47_reduced_x87.asi`
+- Patch blobs: `scripts/hc47_reduced_x87/*.x87`
+- Log: `scripts/hc47_reduced_x87.log`
 
 Expected log after launch includes the number of applied hooks, for example
 `applied: 1187/1187 hooks`.
 
-### Diagnostic: EIP-sampling profiler (`HC47Profile.asi`)
+### Diagnostic: EIP-sampling profiler (`hc47_profile.asi`)
 
 Not part of the default build. A sampling profiler for deciding where the
 remaining CrossOver/Rosetta time goes — untranslated x87 functions, other
@@ -133,11 +136,11 @@ modules, or the graphics stack:
 
 ```sh
 (cd runtime && make prof)
-cp dist/HC47Profile.asi "$HC47_GAME_DIR/scripts/"
+cp dist/hc47_profile.asi "$HC47_GAME_DIR/scripts/"
 ```
 
 It suspends each running game thread ~250 times per second, samples EIP via
-`GetThreadContext`, and appends a report to `scripts/HC47Profile.log` every
+`GetThreadContext`, and appends a report to `scripts/hc47_profile.log` every
 10 s: per-module sample shares, the hottest 16-byte code buckets as
 `module+rva`, and — by following the installed entry hooks and the `.x87`
 func tables — per-function counts for translated code, keyed by original
@@ -160,14 +163,37 @@ If a specific translated function misbehaves, exclude it by RVA:
 python3 tools/translate.py HitmanDlc.dlc --exclude 0x214f0,0x257c0
 ```
 
-## Plugin: HUD Scale (`HC47HudScale.asi`)
+## Plugin: Tweaks (`hc47_tweaks.asi`)
 
-This plugin scales the game's 2D layer: menus, HUD, text, and cursor. It works
+One plugin housing the four gameplay/graphics features. They ship as a
+single ASI because they are closely coupled: Widescreen and HUD Scale
+coordinate over the same `ZSysInterface` resolution fields (a mode-change
+handshake that used to be a cross-DLL export); Frame Limit and HUD Extras
+hook the same System.dll frame-latch function (the entry and its clock
+call site respectively, which must not overlap); and HUD Extras positions
+its overlay in HUD Scale's virtual GUI pixels.
+
+Config: `scripts/hc47_tweaks.ini` — one section per feature, documented
+below. Log: `scripts/hc47_tweaks.log` (each line is tagged with the
+feature it comes from). Install output:
+
+- ASI: `scripts/hc47_tweaks.asi`
+- Config: `scripts/hc47_tweaks.ini`
+- Log: `scripts/hc47_tweaks.log`
+
+`install.sh` migrates the per-plugin `.ini` files of the previous layout
+(HudScale/HudExtras/Widescreen/FrameLimit) into `hc47_tweaks.ini` on first
+install — sections and keys are unchanged — and removes the superseded
+`.asi` files so they cannot double-patch alongside the merged plugin.
+
+### Feature: HUD Scale
+
+Scales the game's 2D layer: menus, HUD, text, and cursor. It works
 in exclusive fullscreen, borderless, and windowed modes.
 
 The game lays out GUI elements against the resolution fields in
 `ZSysInterface`, while the renderer maps normalized GUI coordinates to its
-real display mode. `HC47HudScale.asi` waits for display setup, then keeps
+real display mode. The feature waits for display setup, then keeps
 `width / Scale` and `height / Scale` pinned into the GUI-facing
 `ZSysInterface` fields. The GUI lays out for a smaller virtual screen and the
 renderer stretches it back to the real viewport. The 3D scene and actual
@@ -178,7 +204,7 @@ resolution into the current-mode fields already at window creation,
 hundreds of ms before display-mode selection reads the requested fields
 back. Writing the virtual size in that window makes fullscreen mode
 selection pick a real display mode of the *virtual* size, silently
-downgrading a 4K request to 1080p with an unscaled GUI. The plugin
+downgrading a 4K request to 1080p with an unscaled GUI. The feature
 therefore applies from an ntdll loader notification when `HitmanDlc.dlc`
 loads — after renderer init is fully done, before any GUI layout code
 (which lives in that DLL) can run — and gates its re-apply watchdog on
@@ -188,7 +214,7 @@ the same condition.
 rasterized at the real pixel size instead of being magnified from the smaller
 virtual layout.
 
-Config: `scripts/HC47HudScale.ini`
+Config (`hc47_tweaks.ini`):
 
 ```ini
 [HudScale]
@@ -196,20 +222,14 @@ Scale=2.0        ; 1.0 disables; fractional values such as 1.5 work
 SharpText=1      ; rasterize TTF fonts at real pixel size
 ```
 
-Install output:
-
-- ASI: `scripts/HC47HudScale.asi`
-- Config: `scripts/HC47HudScale.ini`
-- Log: `scripts/HC47HudScale.log`
-
 Diagnostic tooling used while reverse-engineering the GUI pipeline lives in
 `runtime/rtrace.c` and can be built with `make rtrace` from `runtime/`;
 `runtime/wmdiag.c` (`make wmdiag`) plants one-shot breakpoint probes on the
 RenderD3D display-init path and logs which step fails with what HRESULT.
 
-## Plugin: HUD Extras (`HC47HudExtras.asi`)
+### Feature: HUD Extras
 
-This plugin adds small HUD features without changing the 3D renderer.
+Adds small HUD features without changing the 3D renderer.
 
 Features:
 
@@ -224,7 +244,7 @@ Features:
 - **FPS readout** renders a second HUD label below the timer, derived from the
   engine's own frame timestamps.
 
-Config: `scripts/HC47HudExtras.ini`
+Config (`hc47_tweaks.ini`):
 
 ```ini
 [HudExtras]
@@ -236,23 +256,17 @@ TextY=100            ; just below the top-left base-game HUD
 LineGap=16
 ```
 
-Install output:
+### Feature: Widescreen
 
-- ASI: `scripts/HC47HudExtras.asi`
-- Config: `scripts/HC47HudExtras.ini`
-- Log: `scripts/HC47HudExtras.log`
-
-## Plugin: Widescreen (`HC47Widescreen.asi`)
-
-This plugin makes the game render correctly at any resolution and aspect
+Makes the game render correctly at any resolution and aspect
 ratio. It needs no resolution configuration of its own: it takes the
 resolution from hitman.ini and reads the live display mode from
-`ZSysInterface` at run time, so it composes cleanly with `HC47HudScale`.
+`ZSysInterface` at run time, so it composes cleanly with HUD Scale.
 Three patch groups:
 
 - **Resolution passthrough** — the renderer's mode-set path snaps the
   requested width to a fixed 4:3 ladder (512..1600) in exclusive
-  fullscreen. The plugin flips the guarding `je` to an unconditional jump
+  fullscreen. The feature flips the guarding `je` to an unconditional jump
   in whichever renderer is loaded (`RenderD3D.dll` / `RenderOpenGL.dll`),
   so any `Resolution WxH` from hitman.ini passes through unmodified.
   (The stock ladder is also broken for widths it does not know: it loads
@@ -347,7 +361,7 @@ Three patch groups:
   "Renderer and window-mode support" above) instead of letting the game
   die with a fatal display-mode error.
 - **FOV correction** — the real display mode is read from `ZSysInterface`
-  (the current-mode fields `HC47HudScale` leaves real) and every FOV
+  (the current-mode fields HUD Scale leaves real) and every FOV
   source gets the standard Vert- to Hor+ correction
   `new = 2*atan(tan(old/2) * (aspect / (4/3)))`. The six camera setups
   pushing the 67.4-degree constant into `SetFOV` are rewritten in place
@@ -362,7 +376,7 @@ Three patch groups:
 All patch sites are byte-checked against the retail build (module timestamp
 and image size included); a mismatch skips that patch path and logs it.
 
-Config: `scripts/HC47Widescreen.ini`
+Config (`hc47_tweaks.ini`):
 
 ```ini
 [Widescreen]
@@ -379,21 +393,39 @@ ModernResolutionList=1 ; replace the options menu's 4:3 mode table with
                        ; common modern resolutions; 0 keeps the stock list
 ```
 
-Install output:
-
-- ASI: `scripts/HC47Widescreen.asi`
-- Config: `scripts/HC47Widescreen.ini`
-- Log: `scripts/HC47Widescreen.log`
-
 No other widescreen or FOV patcher should be active at the same time —
 two patchers on the same sites either double-patch or fail their byte
 checks.
+
+### Feature: Frame Limit
+
+The engine has no frame limiter: the per-frame game-time latch in
+System.dll copies current to previous time and samples a new timestamp
+with no pacing anywhere in the main loop. On fast machines the frame rate
+is whatever vsync (or nothing) allows, and running much above 60 fps is
+known to cause gameplay and camera bugs in this engine.
+
+The feature hooks the latch's clock call site (byte-checked; the latch
+entry itself belongs to HUD Extras' frame tick) and stalls each
+frame until the configured period has elapsed, measured with
+`QueryPerformanceCounter` — sleeping while more than a few milliseconds
+remain, spinning the rest for accuracy. Pacing happens before the engine
+samples its clock, so the measured frame delta stays clean at the cap.
+The deadline advances one period per frame and resyncs after loads or
+hitches instead of fast-forwarding.
+
+Config (`hc47_tweaks.ini`):
+
+```ini
+[FrameLimit]
+FpsCap=60        ; frames per second; 0 disables the cap
+```
 
 ## ASI Loader (`dsound.dll`)
 
 A minimal dsound.dll proxy (`runtime/asiloader.c`) that loads every
 `*.asi` from `scripts/` at process attach and logs to
-`scripts/HC47AsiLoader.log`.
+`scripts/hc47_asi_loader.log`.
 
 The game pulls it in through its sound stack: `EAX.dll` imports dsound
 ordinal 1, `Sound.dll` ordinal 2, and `a3d.dll` imports by name. The
@@ -408,36 +440,6 @@ Under Wine/CrossOver the bottle needs the DLL override
 `dsound=native,builtin` so the game-directory proxy is picked over the
 builtin — any bottle where an ASI loader ever worked already has it
 (check with `grep dsound user.reg` in the bottle directory).
-
-## Plugin: Frame Limit (`HC47FrameLimit.asi`)
-
-The engine has no frame limiter: the per-frame game-time latch in
-System.dll copies current to previous time and samples a new timestamp
-with no pacing anywhere in the main loop. On fast machines the frame rate
-is whatever vsync (or nothing) allows, and running much above 60 fps is
-known to cause gameplay and camera bugs in this engine.
-
-The plugin hooks the latch's clock call site (byte-checked; the latch
-entry itself belongs to `HC47HudExtras`'s frame tick) and stalls each
-frame until the configured period has elapsed, measured with
-`QueryPerformanceCounter` — sleeping while more than a few milliseconds
-remain, spinning the rest for accuracy. Pacing happens before the engine
-samples its clock, so the measured frame delta stays clean at the cap.
-The deadline advances one period per frame and resyncs after loads or
-hitches instead of fast-forwarding.
-
-Config: `scripts/HC47FrameLimit.ini`
-
-```ini
-[FrameLimit]
-FpsCap=60        ; frames per second; 0 disables the cap
-```
-
-Install output:
-
-- ASI: `scripts/HC47FrameLimit.asi`
-- Config: `scripts/HC47FrameLimit.ini`
-- Log: `scripts/HC47FrameLimit.log`
 
 ## Verification
 

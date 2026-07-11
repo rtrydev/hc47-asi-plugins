@@ -6,7 +6,7 @@
  * by 16-byte EIP bucket, so hot untranslated functions show up directly as
  * module+rva.
  *
- * If HC47ReducedX87 patch files are present next to this ASI, the profiler
+ * If hc47_reduced_x87 patch files are present next to this ASI, the profiler
  * parses them and follows the installed 5-byte entry hooks to find each
  * translated blob. Samples inside a blob are attributed back to the
  * ORIGINAL function rva ("x87:module+rva"), so translated and untranslated
@@ -16,7 +16,7 @@
  * samples are (almost) exclusively untranslated code — the top-bucket list
  * is the priority list for extending translation coverage.
  *
- * Output: scripts/HC47Profile.log, a cumulative report every DUMP_MS.
+ * Output: scripts/hc47_profile.log, a cumulative report every DUMP_MS.
  */
 #include <windows.h>
 #include <tlhelp32.h>
@@ -140,7 +140,7 @@ static int cmp_by_bloboff(const void *a, const void *b)
 static void load_patch_files(const char *dir)
 {
     char pat[MAX_PATH];
-    snprintf(pat, sizeof(pat), "%s\\HC47ReducedX87\\*.x87", dir);
+    snprintf(pat, sizeof(pat), "%s\\hc47_reduced_x87\\*.x87", dir);
     WIN32_FIND_DATAA fd;
     HANDLE fh = FindFirstFileA(pat, &fd);
     if (fh == INVALID_HANDLE_VALUE) {
@@ -150,7 +150,7 @@ static void load_patch_files(const char *dir)
     do {
         if (g_n_patches >= MAX_PATCHES) break;
         char path[MAX_PATH];
-        snprintf(path, sizeof(path), "%s\\HC47ReducedX87\\%s", dir,
+        snprintf(path, sizeof(path), "%s\\hc47_reduced_x87\\%s", dir,
                  fd.cFileName);
         FILE *f = fopen(path, "rb");
         if (!f) continue;
@@ -536,7 +536,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         char *sl = strrchr(dir, '\\');
         if (sl) *sl = 0;
         char path[MAX_PATH];
-        snprintf(path, sizeof(path), "%s\\HC47Profile.log", dir);
+        snprintf(path, sizeof(path), "%s\\hc47_profile.log", dir);
         g_log = fopen(path, "w");
         logf_("HC47 EIP profiler loaded (%d ms period)", SAMPLE_MS);
         g_n_slots = 1;   /* slot 0 = anon */

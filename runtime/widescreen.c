@@ -1,6 +1,7 @@
-/* HC47 Widescreen — native widescreen support for Hitman: Codename 47
- * (32-bit ASI). Takes the resolution from hitman.ini and the live display
- * mode from ZSysInterface, so it composes cleanly with HC47HudScale.
+/* Widescreen feature of hc47_tweaks.asi — native widescreen support for
+ * Hitman: Codename 47. Takes the resolution from hitman.ini and the live
+ * display mode from ZSysInterface, so it composes cleanly with the
+ * hudscale feature.
  *
  * What the stock game does wrong at non-4:3 resolutions:
  *  1. The renderer's mode-set path (RenderD3D.dll / RenderOpenGL.dll)
@@ -19,7 +20,7 @@
  *    renderer is loaded, so the requested hitman.ini resolution passes
  *    through unmodified.
  *  - FOV: the real display mode is read from ZSysInterface (+0x21/+0x25 —
- *    the fields HC47HudScale leaves untouched) and each FOV source gets
+ *    the fields HudScale leaves untouched) and each FOV source gets
  *    the standard Vert- -> Hor+ correction
  *        new = 2*atan(tan(old/2) * (aspect / (4/3)))
  *    The six 67.4-degree push sites are rewritten in place (the gameplay
@@ -140,7 +141,7 @@
  * module appears, applies the HitmanDlc patches once the display mode is
  * known, and rewrites the FOV constants if the mode changes at run time.
  *
- * Config: scripts/HC47Widescreen.ini
+ * Config (hc47_tweaks.ini):
  *   [Widescreen]
  *   Enabled=1
  *   FOVFactor=1.0          ; extra factor on the gameplay camera FOV
@@ -161,13 +162,15 @@
 #include <string.h>
 #include <math.h>
 
+#include "common.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
 /* ZSysInterface (packed struct, ?g_pSysInterface@@3PAVZSysInterface@@A
  * from Globals.dll); +0x21/+0x25 hold the real current mode set by the
- * renderer — HC47HudScale only rewrites +0x19/+0x1d. */
+ * renderer — HudScale only rewrites +0x19/+0x1d. */
 #define SI_CURW  0x21
 #define SI_CURH  0x25
 
@@ -339,8 +342,6 @@ static const uint8_t INIWRITE_TAIL[10] = {      /* after mov eax,[slot] */
     0x8b, 0x00, 0x53, 0x89, 0x4c, 0x24, 0x08, 0x8a, 0x48, 0x50
 };
 
-static FILE *g_log;
-static char g_dir[MAX_PATH];
 static int g_enabled = 1;
 static float g_fovfactor = 1.0f;
 static float g_ddfactor = 1.0f;
@@ -374,18 +375,19 @@ static volatile LONG g_bar_fills;    /* presents that still colorfill the
                                         CrossOver Mac driver; 4 strips
                                         per frame took 60fps to ~22) */
 
-/* Cross-plugin handshake with HC47HudScale: a GetTickCount stamp,
- * nonzero from the moment an in-game mode change is staged until the
- * renderer has consumed the ZSysInterface layout fields (+0x19/+0x1d)
- * for the new mode. HudScale normally keeps its virtual GUI size in
- * those fields and re-applies it whenever the game rewrites them — but
- * during a re-init the renderer reads them back as the DISPLAY MODE, so
- * a mid-flight re-apply gets adopted as the mode (observed: a 1800x1012
- * apply came up as a 900x506 mode with the GUI at quarter size, halving
- * again on every apply). HudScale holds off while this is set and
- * treats a stamp older than ~3s as stale, so renderer paths without the
- * capture hook (OpenGL, letterbox off) cannot wedge it. */
-__declspec(dllexport) volatile DWORD HC47_ModeChangeTick;
+/* Handshake with the hudscale feature (declared in common.h): a
+ * GetTickCount stamp, nonzero from the moment an in-game mode change is
+ * staged until the renderer has consumed the ZSysInterface layout
+ * fields (+0x19/+0x1d) for the new mode. HudScale normally keeps its
+ * virtual GUI size in those fields and re-applies it whenever the game
+ * rewrites them — but during a re-init the renderer reads them back as
+ * the DISPLAY MODE, so a mid-flight re-apply gets adopted as the mode
+ * (observed: a 1800x1012 apply came up as a 900x506 mode with the GUI
+ * at quarter size, halving again on every apply). HudScale holds off
+ * while this is set and treats a stamp older than ~3s as stale, so
+ * renderer paths without the capture hook (OpenGL, letterbox off)
+ * cannot wedge it. */
+volatile DWORD HC47_ModeChangeTick;
 
 static void modechange_begin(void)
 {
@@ -404,19 +406,16 @@ static uint32_t g_dd_out;          /* scaled far clip, float bits */
 
 static void logf_(const char *fmt, ...)
 {
-    if (!g_log) return;
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
+    hc47_vlog("widescreen", fmt, ap);
     va_end(ap);
-    fputc('\n', g_log);
-    fflush(g_log);
 }
 
 static void read_config(void)
 {
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\HC47Widescreen.ini", g_dir);
+    snprintf(path, sizeof(path), "%s\\%s", hc47_dir, HC47_INI);
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[128];
@@ -480,7 +479,7 @@ static int desktop_size(int32_t *w, int32_t *h)
 static int drawdll_is_d3d(void)
 {
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\..\\Hitman.ini", g_dir);
+    snprintf(path, sizeof(path), "%s\\..\\Hitman.ini", hc47_dir);
     FILE *f = fopen(path, "r");
     if (!f) return 1;
     int d3d = 1;
@@ -648,7 +647,7 @@ void __cdecl drawdist_entry(uint32_t *regs)
 
 /* Options-screen sync (vtbl+0xdc, runs on every screen open): the config
  * block was just filled from LIVE ZSysInterface +0x19/+0x1d — under this
- * plugin stack that is HC47HudScale's virtual GUI size, and under
+ * plugin stack that is HudScale's virtual GUI size, and under
  * borderless the mode is the converted fit anyway, so neither is what
  * the player picked. This hook owns the selection completely:
  *  - resolve the picked resolution to a table entry (exact match, else
@@ -728,7 +727,7 @@ void __cdecl reslist_entry(uint32_t *regs)
  * sits BEFORE the attach code copies +0x19/+0x1d into the current-mode
  * fields (+0x21/+0x25 at rva 0x29476) and sizes the window from them, so
  * it is the last safe moment to make sure those fields hold the REAL
- * mode: HC47HudScale keeps its virtual GUI size in them, and a re-init
+ * mode: HudScale keeps its virtual GUI size in them, and a re-init
  * that reads the virtual size adopts it as the display mode. */
 void __cdecl reinit_entry(uint32_t *regs)
 {
@@ -805,7 +804,7 @@ void __cdecl setres_entry(uint32_t *regs)
     int32_t cur;
     /* change detection against the CURRENT-mode fields (+0x21/+0x25),
      * not the layout fields the stock code compares (+0x19/+0x1d): under
-     * HC47HudScale the layout fields hold the virtual GUI size, which
+     * HudScale the layout fields hold the virtual GUI size, which
      * would flag every same-mode re-apply (e.g. the settings-confirm
      * commit) as a change and force a needless window recreate */
     const struct { int32_t val; int curoff, pendoff; } f[3] = {
@@ -954,7 +953,7 @@ void __cdecl present_entry(uint32_t *regs)
 
 /* Wraps the hitman.ini writer (thiscall, no stack args): the borderless
  * conversion left the CONVERTED mode in si+0x19/+0x1d and cleared the
- * fullscreen byte si+0x12 (and by save time HC47HudScale has usually
+ * fullscreen byte si+0x12 (and by save time HudScale has usually
  * replaced +0x19/+0x1d with its virtual GUI size on top) — none of which
  * is what the player picked. Restore the picked resolution and
  * fullscreen preference (tracked by the conversion and the SetResolution
@@ -1432,7 +1431,7 @@ static int guard_resolution(uint8_t *si)
         return 0;                         /* ini not parsed yet — retry */
 
     /* remember what hitman.ini actually asked for (this runs before any
-     * conversion and before HC47HudScale replaces +0x19/+0x1d with its
+     * conversion and before HudScale replaces +0x19/+0x1d with its
      * virtual GUI size): the ini-writer wrap restores these at save time
      * so the file round-trips the player's preference */
     if (g_req_w < 320 || g_req_h < 200) {
@@ -1705,7 +1704,7 @@ static DWORD WINAPI watch_thread(LPVOID arg)
     (void)arg;
     int snap_state = 0, dlc_state = 0;
     /* the ini save fix matters beyond the borderless conversion: the
-     * writer reads si+0x19/+0x1d, which HC47HudScale replaces with its
+     * writer reads si+0x19/+0x1d, which HudScale replaces with its
      * virtual GUI size — install it unconditionally */
     int ini_state = 0;
     int snap_tries = 0;
@@ -1780,25 +1779,14 @@ static DWORD WINAPI watch_thread(LPVOID arg)
     return 0;
 }
 
-BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+void widescreen_init(void)
 {
-    (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(inst);
-        GetModuleFileNameA(inst, g_dir, sizeof(g_dir));
-        char *sl = strrchr(g_dir, '\\');
-        if (sl) *sl = 0;
-        char logpath[MAX_PATH];
-        snprintf(logpath, sizeof(logpath), "%s\\HC47Widescreen.log", g_dir);
-        g_log = fopen(logpath, "w");
-        read_config();
-        logf_("HC47 Widescreen loaded%s, FOVFactor=%.2f DrawDistanceFactor=%.2f "
-              "PreserveAspectRatio=%d ModernResolutionList=%d",
-              g_enabled ? "" : " (disabled)",
-              (double)g_fovfactor, (double)g_ddfactor, g_preserve_aspect,
-              g_modern_list);
-        if (g_enabled)
-            CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
-    }
-    return TRUE;
+    read_config();
+    logf_("%sFOVFactor=%.2f DrawDistanceFactor=%.2f "
+          "PreserveAspectRatio=%d ModernResolutionList=%d",
+          g_enabled ? "" : "(disabled) ",
+          (double)g_fovfactor, (double)g_ddfactor, g_preserve_aspect,
+          g_modern_list);
+    if (g_enabled)
+        CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
 }
